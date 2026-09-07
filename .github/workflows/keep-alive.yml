@@ -1,0 +1,54 @@
+# GitHub Actions: 定时 ping Supabase 防 7 天休眠
+# - 每 3 天 UTC 9:00 跑一次（北京时间 17:00）
+# - 也支持手动触发（Actions → Keep Supabase Alive → Run workflow）
+# - 双保险：先调一次 REST API 读，再调一次 RPC 写（确保产生 DB activity）
+name: Keep Supabase Alive
+
+on:
+  schedule:
+    # 每 3 天的 9:00 UTC（北京时间 17:00）
+    - cron: '0 9 */3 * *'
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Supabase REST API (read)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          echo "→ REST GET /vocab_books?limit=1"
+          HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            "${SUPABASE_URL}/rest/v1/vocab_books?select=id&limit=1" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}")
+          echo "← HTTP $HTTP"
+          cat /tmp/resp.json
+          if [ "$HTTP" != "200" ]; then
+            echo "❌ Ping failed (HTTP $HTTP)"
+            exit 1
+          fi
+          echo "✅ Supabase is alive (read)"
+
+      - name: Call keep_alive RPC (write)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          echo "→ POST /rest/v1/rpc/keep_alive"
+          HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST \
+            "${SUPABASE_URL}/rest/v1/rpc/keep_alive" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "← HTTP $HTTP"
+          cat /tmp/resp.json
+          if [ "$HTTP" != "200" ]; then
+            echo "⚠️  RPC failed (HTTP $HTTP)，但项目应该已经被上一步唤醒"
+          else
+            echo "✅ Supabase keep_alive RPC succeeded"
+          fi
