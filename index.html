@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="icisFxhA3pcJYb4uCYYV7W">
+<head data-page-node-id="CzOPDLhG3BqfpOfPnL37tx">
+  <meta charset="UTF-8" data-page-node-id="waIDoYnGCb2iFEBQxJic6c" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="U0EwChTT9dJFUovYEe6NOg" />
+  <title>雅思词汇工作台 · VocabMaster</title>
+  <link rel="stylesheet" href="styles.css" data-page-node-id="uxAwwmawcJrJgnd1Zyc4X1" />
+</head>
+<body data-page-node-id="DLlBgq9Eh76QuExUifuECW">
+  <div id="app" data-page-node-id="mMAB3AbdKZM0KBSVUMLEXT">
+    <!-- 顶部导航 -->
+    <header class="topbar" data-page-node-id="CFhm65ibuoLF4aB931hhFB">
+      <div class="brand" data-page-node-id="CA2azHKn4MzwciswTxAxc8">
+        <span class="logo" data-page-node-id="HUypfTB0Sv8frWU77qgvUU">📚</span>
+        <div data-page-node-id="EHf9tGq9D1aC8w534lpNWu">
+          <h1 data-page-node-id="ozfqePuh0jiUVMcwpOTGAz">雅思词汇工作台</h1>
+          <p class="sub" data-page-node-id="D0J6Sy1LfHuyjmIuTMsaFq">VocabMaster · 导入→背诵→错词闭环→文章巩固</p>
+        </div>
+      </div>
+      <nav class="tabs" role="tablist" data-page-node-id="f5lIw86qnt96Gh4XovdHD3">
+        <button class="tab active" data-tab="home" data-page-node-id="ABbBZDTxIY7NxAFSL7USda">首页</button>
+        <button class="tab" data-tab="study" data-page-node-id="dEfYM2CoDaSdbzcVbejmy2">背诵</button>
+        <button class="tab" data-tab="listen" data-page-node-id="icnvT7hX3pcJYb4uCYYV70">听音</button>
+        <button class="tab" data-tab="spell" data-page-node-id="icnvT7hX3pcJYb4uCYYV7W">拼写</button>
+        <button class="tab" data-tab="review" data-page-node-id="icnvT7hX3pcJYb4uCYYRX1">复习计划</button>
+        <button class="tab" data-tab="notebooks" data-page-node-id="VMhqCSSUjmlLBMtfwSGZNZ">单词本</button>
+        <button class="tab" data-tab="wrong" data-page-node-id="JgYBHcy4rI8gTyGLatsjHe">错词本</button>
+        <button class="tab" data-tab="dict" data-page-node-id="zmh3fvnqZkrelkFxY7yTYH">字典</button>
+        <button class="tab" data-tab="article" data-page-node-id="l4FY5Ta7FNYX836kjyXazM">AI文章</button>
+        <button class="tab" data-tab="stats" data-page-node-id="VeAPKUMcMdlOkrP6C7uQQE">统计</button>
+      </nav>
+    </header>
+
+    <main class="main" data-page-node-id="bmMU1Np2jGGbNOotuUzQBD">
+      <!-- 首页：导入 -->
+      <section class="panel active" id="panel-home" data-page-node-id="0RnvNCOvRERFX2wgS5YPau">
+        <div class="hero" data-page-node-id="mGIpN70BRaAG5RI9qFdG47">
+          <h2 data-page-node-id="uKpHAR60Z4ipoSI5RUxxuQ">开始一次新的导入</h2>
+          <p data-page-node-id="oC33vlrntnE2TLLJqR90Cu">每导入一次，就会生成一本独立的单词本。认识的不再出现，不认识的进入错词本（需认识 3 次才能毕业）。</p>
+        </div>
+
+        <div class="card" data-page-node-id="ctZywgC9KFr8HNGlwrPTid">
+          <h3 data-page-node-id="dyyQhUU5AmQD9bVisfrXAS">① 命名这本单词本</h3>
+          <input id="bookName" class="input" placeholder="例如：雅思真题词汇 - Test 18" data-page-node-id="JeIbRZJTuYN4r5dEktGpWv" />
+        </div>
+
+        <div class="card" data-page-node-id="LFxHNXXszYRd27Dc037DMg">
+          <h3 data-page-node-id="fFBeF1HmzAXoIb6RYUm9Sv">② 输入词汇</h3>
+          <p class="muted" data-page-node-id="phMg5DfuYWMFlHy83qKThB">支持<b>单词 / 短语 / 句子</b>，一行一个，英文与中文之间用 <code data-page-node-id="hmr2GAOxz6eElTqMiItL6g">#</code> 隔开。<b style="color:var(--primary)">全部识别，绝不跳过。</b>出现时自动英式发音。</p>
+          <textarea id="wordsInput" class="textarea" rows="10" placeholder="例如：
+abandon#vt. 放弃，抛弃
+give up#phr. 放弃，戒除
+I decided to give up smoking.#我决定戒烟。"></textarea>
+          <div class="row between" data-page-node-id="gPD2DPm763lSDQIbeEwNUd">
+            <div class="row gap" data-page-node-id="qZ0yJgUFDe6JBFYmvpA01i">
+              <button class="btn ghost" id="loadSample" data-page-node-id="9sIkd1VgsVoyZSFRaGOWH2">载入示例</button>
+              <button class="btn ghost" id="clearInput" data-page-node-id="UtmgYfcdQblSPlndEBKSHg">清空</button>
+              <span id="parseHint" class="muted" data-page-node-id="phMeTWdWxTkB91C6v953BV"></span>
+            </div>
+            <button class="btn primary" id="createBook" data-page-node-id="pDUXnJTESJKbvKVazFG7q6">📘 生成单词本并开始背诵</button>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="vB9MoKz1dKoVHeBtzmejli">
+          <h3 data-page-node-id="OrdlkrsOZ77jNQrAKaZKDx">导入技巧</h3>
+          <ul class="tips" data-page-node-id="b5KHpOFi76BCiEOuq1S26Q">
+            <li data-page-node-id="KliKYGafamO1bE1LcJGXNn">每行一个词条，词、释义、例句用空格/制表符分隔，词与释义之间也可用 <code data-page-node-id="9pi5RaFbjCrFANQ7wGHV0D">/</code> 或 <code data-page-node-id="Uxaoub98oDJWYF9qkhjIw4">-</code>。</li>
+            <li data-page-node-id="zmSP4Y02M7uloMBwBf9Jpy">缺释义时会调用内置词典补全（雅思常考释义）。</li>
+            <li data-page-node-id="ezpCjj5yimSSEfCNGaGHso">同一单词本内不会重复加入相同的单词。</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- 背诵 -->
+      <section class="panel" id="panel-study" data-page-node-id="xWVJAKHTHMBSFoPjyd1ODm">
+        <div class="row between" data-page-node-id="7KlYB4EpJX9rIceyrOwjiZ">
+          <div data-page-node-id="CoFo9e2KLyowMdKiGIwnau">
+            <h2 id="studyTitle" data-page-node-id="0PfnIuj1HYZW5D57uHTjBo">请先选择一本单词本</h2>
+            <p id="studySub" class="muted" data-page-node-id="GVEzKvs2rhbA9o5HhkPbY0">—</p>
+          </div>
+          <div class="row gap" data-page-node-id="OxKJxniVDbDtSD1b0b9tlL">
+            <select id="studyBookSelect" class="select" data-page-node-id="INkAByxzPc10yPIcERmFO1"></select>
+            <button class="btn ghost" id="restartBook" data-page-node-id="8hL1BuPf6JOGIik1Zx1rW4">重置进度</button>
+          </div>
+        </div>
+
+        <div id="studyArea" data-page-node-id="iamL7Ps66nePcQq6py5s4l"></div>
+      </section>
+
+      <!-- 拼写平台 -->
+      <section class="panel" id="panel-spell" data-page-node-id="icnvT7hX3pcJYb4uCYYV7X">
+        <div class="row between" data-page-node-id="icnvT7hX3pcJYb4uCYYV7Y">
+          <div data-page-node-id="icnvT7hX3pcJYb4uCYYV7Z">
+            <h2 id="spellTitle" data-page-node-id="icnvT7hX3pcJYb4uCYYV80">拼写训练</h2>
+            <p id="spellSub" class="muted" data-page-node-id="icnvT7hX3pcJYb4uCYYV81">—</p>
+          </div>
+          <div class="row gap wrap" data-page-node-id="icnvT7hX3pcJYb4uCYYV82">
+            <select id="spellScopeSelect" class="select" style="min-width:180px" data-page-node-id="icnvT7hX3pcJYb4uCYYV83"></select>
+            <button class="btn ghost" id="spellRefresh" data-page-node-id="icnvT7hX3pcJYb4uCYYV84">重新生成队列</button>
+          </div>
+        </div>
+
+        <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <span class="muted small">快捷进入：</span>
+          <button class="btn small-btn" data-spell-scope="due" id="spellShortcutDue">📅 今日到期（SRS）</button>
+          <button class="btn small-btn" data-spell-scope="wrong" id="spellShortcutWrong">🔥 错词本</button>
+          <button class="btn small-btn" data-spell-scope="all" id="spellShortcutAll">📚 全部词条</button>
+          <span class="muted small" style="margin-left:8px">选择单词本：</span>
+          <select id="spellBookPicker" class="select" style="min-width:160px"></select>
+          <button class="btn primary small-btn" id="spellBookGo">✍ 拼写该单词本</button>
+        </div>
+
+        <div id="spellInfoBar" class="card" style="padding:10px 16px" data-page-node-id="icnvT7hX3pcJYb4uCYYV85"></div>
+        <div id="spellArea" data-page-node-id="icnvT7hX3pcJYb4uCYYV86"></div>
+      </section>
+
+      <!-- 听音辨义 -->
+      <section class="panel" id="panel-listen" data-page-node-id="icnvT7hX3pcJYb4uCYYV71">
+        <div class="row between" data-page-node-id="icnvT7hX3pcJYb4uCYYV72">
+          <div data-page-node-id="icnvT7hX3pcJYb4uCYYV73">
+            <h2 data-page-node-id="icnvT7hX3pcJYb4uCYYV74">听音辨义</h2>
+            <p class="muted" data-page-node-id="icnvT7hX3pcJYb4uCYYV75">只放声音，不显示拼写。在心里想它的意思，然后选择认识 / 不认识。点开后会揭示真实释义，发现想错还可以重判。</p>
+          </div>
+        </div>
+
+        <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <span class="muted small">选择单词本：</span>
+          <select id="listenBookPicker" class="select" style="min-width:160px"></select>
+          <button class="btn primary small-btn" id="listenBookGo">🔊 开始听音</button>
+          <button class="btn ghost small-btn" id="listenRepeat" title="再播一次当前词的发音">🔁 再听一次</button>
+        </div>
+
+        <div id="listenInfoBar" class="card" style="padding:10px 16px" data-page-node-id="icnvT7hX3pcJYb4uCYYV76"></div>
+        <div id="listenArea" data-page-node-id="icnvT7hX3pcJYb4uCYYV77"></div>
+      </section>
+
+      <!-- 复习计划（艾宾浩斯） -->
+      <section class="panel" id="panel-review" data-page-node-id="icnvT7hX3pcJYb4uCYYV87">
+        <div class="row between" data-page-node-id="icnvT7hX3pcJYb4uCYYV88">
+          <div data-page-node-id="icnvT7hX3pcJYb4uCYYV89">
+            <h2 data-page-node-id="icnvT7hX3pcJYb4uCYYV8A">艾宾浩斯复习计划</h2>
+            <p class="muted" data-page-node-id="icnvT7hX3pcJYb4uCYYV8B">按 1 · 2 · 4 · 7 · 15 · 30 天的阶梯自动排每日复习。拼错就回到第 1 阶梯重来。<b style="color:var(--primary)">以单词本为单位</b>规划每日计划。</p>
+          </div>
+          <div class="row gap wrap" data-page-node-id="icnvT7hX3pcJYb4uCYYV8C">
+            <select id="reviewBookPicker" class="select" style="min-width:180px"></select>
+            <button class="btn primary" id="reviewStartSpell" data-page-node-id="icnvT7hX3pcJYb4uCYYV8D">✍ 拼写今日到期词</button>
+            <button class="btn" id="reviewStartAllSpell" data-page-node-id="icnvT7hX3pcJYb4uCYYV8E">✍ 拼写全部（含未到期）</button>
+          </div>
+        </div>
+        <div id="reviewArea" data-page-node-id="icnvT7hX3pcJYb4uCYYV8F"></div>
+      </section>
+
+      <!-- 单词本列表 -->
+      <section class="panel" id="panel-notebooks" data-page-node-id="zIvHqx68FxT54iHxMJAEHO">
+        <div class="row between" data-page-node-id="TXedFPBNFOrlfsuwHrNBGQ">
+          <h2 data-page-node-id="oovRlCWuZ5kScMZyBlFVjB">我的单词本</h2>
+          <button class="btn ghost" id="exportAll" data-page-node-id="QUNc6MdP0HXHHRNKGFlywV">导出全部（JSON）</button>
+          <button class="btn ghost" id="importAll" data-page-node-id="icnvT7hX3pcJYb4uCYYV90" title="从之前导出的 JSON 备份恢复（合并或替换）">📥 导入 JSON 备份</button>
+          <input type="file" id="importAllFile" accept="application/json,.json" style="display:none" data-page-node-id="icnvT7hX3pcJYb4uCYYV91" />
+        </div>
+        <div id="bookList" class="grid" data-page-node-id="6UfXzcPXaE1l7kTesNzkRM"></div>
+      </section>
+
+      <!-- 错词本 -->
+      <section class="panel" id="panel-wrong" data-page-node-id="yHulsgJNts3BmY4Iwa8pXm">
+        <div class="row between" data-page-node-id="NodamLHK6Pp3TQj4ukHelv">
+          <div data-page-node-id="YiTq3Wzp2CDT5kwrhp30NN">
+            <h2 data-page-node-id="0yKUfBwtEySMEpXLFdJROm">错词本</h2>
+            <p class="muted" data-page-node-id="AVM7dcSLrSShH66QNGIxwX">每个错词需要连续答对 3 次（在不同次背诵中）才能"毕业"，从错词本移除。<b style="color:var(--primary)">按单词本</b>分别归类。</p>
+          </div>
+          <div class="row gap wrap" data-page-node-id="HM3yZgEFcYdgZQP2iR7A3y">
+            <select id="wrongBookPicker" class="select" style="min-width:180px"></select>
+            <button class="btn primary" id="studyWrong" data-page-node-id="3ulSiCUGgFhWWc2EMRXlQA">开始复习错词</button>
+            <button class="btn ghost danger" id="clearWrong" data-page-node-id="Z6xyAArWoFGBsv0LImfhqN">清空错词本</button>
+          </div>
+        </div>
+        <div id="wrongList" class="grid" data-page-node-id="EBjO49Ic8mzik9nVQ4ZUaM"></div>
+      </section>
+
+      <!-- 字典管理 -->
+      <section class="panel" id="panel-dict" data-page-node-id="Umf5bC0U8ugGKI2MD1WH2A">
+        <div class="row between" data-page-node-id="f53qRRgIEQ3ZMGL05xO30Q">
+          <div data-page-node-id="uASEBtCYBGMYaBna7VPk1C">
+            <h2 data-page-node-id="K10GsiclvekC336tr1EOEd">我的字典</h2>
+            <p class="muted" data-page-node-id="qFwWNzsvTCCoKryX978Nmf">导入后，识别词汇时优先查询这里。<b data-page-node-id="XOKcKWHYNjwYk7IZ11nuCe">单词</b>不带空格，<b data-page-node-id="LYOKPCcjDSc5VGEsmCAKj9">短语</b>用空格分隔；释义用逗号分隔多个义项。</p>
+          </div>
+          <div class="row gap" data-page-node-id="wXTxswwoGGFwhs4EAKZBjZ">
+            <input id="dictSearch" class="input" placeholder="搜索单词或短语..." style="min-width:200px" data-page-node-id="Xwi6B5fEJqzAV7i5f6lpde" />
+            <button class="btn ghost" id="dictExport" data-page-node-id="wKWuCC7DnNsO0Jw5EMuOPi">导出 CSV</button>
+            <button class="btn ghost" id="dictClear" data-page-node-id="NQESbL4fP2vlvficuQM0ks">清空字典</button>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="NHJ1lNovKJgr7bY4scCXTc">
+          <div class="row gap wrap" data-page-node-id="mHD29GCsCGlJRhcDv7KjLB">
+            <div class="grow" data-page-node-id="HWh6jZOdzlb4tWding9mBc">
+              <label class="lbl" data-page-node-id="6AkJhpS2KJdiPs6xcG8Scq">新增条目（每行：词/短语 + 分隔符 + 释义，多义项用逗号；推荐用 <code>#</code>）</label>
+              <textarea id="dictAddInput" class="textarea" rows="5" placeholder="例如：
+abandon#vt. 放弃，抛弃
+abandon ship#phr. 弃船逃生
+be accustomed to#phr. 习惯于
+apply | v. 申请,应用
+"></textarea>
+            </div>
+            <div class="end" data-page-node-id="bfHH6vtiausqz2HwHfYD1G">
+              <button class="btn primary" id="dictAdd" data-page-node-id="ZUbjCnyfsZkQrB9aYwObKM">＋ 加入字典</button>
+            </div>
+          </div>
+          <p class="muted small" data-page-node-id="VSZPmfMAbnUJrwJCnc00m7">说明：含空格的视为短语（phr.）；单词不带空格。下次导入词汇时，会先用这里的字典识别，命中即用你的释义。</p>
+        </div>
+
+        <div class="row gap" style="margin-bottom:12px" data-page-node-id="N9HTJHLdoo63vvWPzsjOQK">
+          <button class="btn" id="dictFilterAll" data-page-node-id="b7EjBEJUaPzgBdJQH24qQS">全部 <span id="dictCountAll" class="muted" data-page-node-id="0ChByjOe3IirH2PsMHsM0y"></span></button>
+          <button class="btn" id="dictFilterWord" data-page-node-id="AMAeVRchnddqpCYn5YsY3D">单词 <span id="dictCountWord" class="muted" data-page-node-id="OGu2TvwqPP3XSDnCs2iUtq"></span></button>
+          <button class="btn" id="dictFilterPhrase" data-page-node-id="HBEu8mQcIznQwDIOkDfmFS">短语 <span id="dictCountPhrase" class="muted" data-page-node-id="qM3sh41qJcZY8g1ZgPwykW"></span></button>
+        </div>
+
+        <div id="dictList" class="grid" data-page-node-id="bbjfWbcXvGg1C4r5HrmhsP"></div>
+      </section>
+
+      <!-- AI 文章生成 -->
+      <section class="panel" id="panel-article" data-page-node-id="Sxs8nDiPAfkWRPmoUZFgC4">
+        <div class="row between" data-page-node-id="P9B5Wdej4eyuqKPrZN1dQ1">
+          <h2 data-page-node-id="9ss6LCDiGOUY0X04iyJNyF">AI 阅读文章生成器</h2>
+          <div class="row gap" data-page-node-id="mUdxmgcTkhJUD3UVYzuX6r">
+            <select id="articleBookSelect" class="select" data-page-node-id="exyrsf3yZGkfW1hZKGVmkf"></select>
+            <button class="btn ghost" id="articleSettings" data-page-node-id="zxeCFOJLXADHb0XKUDNNf5">⚙ 高级设置</button>
+          </div>
+        </div>
+
+        <div class="card" data-page-node-id="PFlw38Pu0qbwl64uVnUrHr">
+          <div class="row gap wrap" data-page-node-id="FbIPP0vEt5C5TqodLQSC7B">
+            <div class="grow" data-page-node-id="jBHizHr1EJ7jmWbQHPwF1M">
+              <label class="lbl" data-page-node-id="vlEcD9LS9ajSCpHm7fwWSV">主题（可空，将基于词汇自动拟题）</label>
+              <input id="articleTopic" class="input" placeholder="例如：留学申请、人工智能、城市生活..." data-page-node-id="WCyl1h6DqyT2oXgaSvyUnG" />
+            </div>
+            <div class="grow" data-page-node-id="ElPTwnZVRs4IfXRAB1iXLc">
+              <label class="lbl" data-page-node-id="7SbPVMMMDBuZQAzuqTKqjk">难度</label>
+              <select id="articleLevel" class="select" data-page-node-id="9OO2PzXtK5H9XtniTjxIxJ">
+                <option value="B1" data-page-node-id="FMuYtn7GZa6Ks9GzYZQoyS">B1 入门（短句为主）</option>
+                <option value="B2" selected data-page-node-id="l6IhkQbFzFVCRIGQL0ZhCM">B2 雅思基础</option>
+                <option value="C1" data-page-node-id="9poE5EwBFA6kcOC0LLJn70">C1 雅思进阶</option>
+                <option value="C2" data-page-node-id="AMRQCyHWhgS9zmFwJMRHez">C2 学术高阶</option>
+              </select>
+            </div>
+            <div class="grow" data-page-node-id="qDqBAAU9bWaEMovfKYfD7R">
+              <label class="lbl" data-page-node-id="tul7N1HsU5h49X6MytTCLl">包含的生词上限</label>
+              <input id="articleMaxNew" type="number" class="input" value="10" min="3" max="40" data-page-node-id="fdRyvY2ZrXGHqEzHAs5hID" />
+            </div>
+            <div class="grow" data-page-node-id="f9yHsTGgyICLlBgI3yHAe7">
+              <label class="lbl" data-page-node-id="gVw3CCtGAZgDEQAjyrC3zo">生成模式</label>
+              <select id="articleMode" class="select" data-page-node-id="QUuBbQphr1Jw5E5J4LPDAB">
+                <option value="smart" selected data-page-node-id="zILEPNbyg4I6xz9EPJDuCP">智能拼装（本地算法）</option>
+                <option value="seed" data-page-node-id="5dKyQ6sxhu4vAZm2QgMHuS">种子句型（仅手工模板）</option>
+              </select>
+            </div>
+            <div class="end" data-page-node-id="BITnvZBMn2bWoCOHsFpxVG">
+              <button class="btn primary" id="generateArticle" data-page-node-id="1kPL23RMWNrCW2MKKue7B8">✨ 生成文章</button>
+            </div>
+          </div>
+          <p class="muted small" data-page-node-id="2qDJB1HnYbkc6bEErFXwgN">说明：智能拼装基于雅思写作高频句型 + 你的词库实时构造文章；点击文中带下划线的生词即可查看释义。</p>
+        </div>
+
+        <div id="articleOut" class="card article-out" data-page-node-id="MoGKeYQJA7aPAU69a5bvjA"></div>
+      </section>
+
+      <!-- 统计 -->
+      <section class="panel" id="panel-stats" data-page-node-id="ZOjuXJ8jnYxlVOwbbueBzM">
+        <h2 data-page-node-id="xQqLNgFQm2WDrprgikC7RE">学习统计</h2>
+        <div id="statsArea" class="grid" data-page-node-id="phy16xnxKXvWvWgLWAB6xX"></div>
+      </section>
+    </main>
+
+    <!-- 编辑释义弹窗 -->
+    <div id="editModal" class="modal hidden" data-page-node-id="Lgwox25quXZaeomWZ1pg1w">
+      <div class="modal-card" data-page-node-id="XCwvW3w5xqPN9eUmiPjnVd">
+        <div class="modal-head" data-page-node-id="GLfIcaApJXOBTfnvmha4DL">
+          <h3 data-page-node-id="V7EZadwNMzk1VzA7kNVKZr">编辑释义</h3>
+          <button class="modal-close" id="editModalClose" data-page-node-id="YJ08YlLQFhjgmvE2GXJscr">✕</button>
+        </div>
+        <div class="modal-body" data-page-node-id="ux9Sbu12KEMOw0CbWE8lBy">
+          <label class="lbl" data-page-node-id="xEg7x6mF4vPAqmYPkrQCgd">单词 / 短语</label>
+          <input id="editWord" class="input" data-page-node-id="otnsDrBxAMQngEOPvjzhnT" />
+          <label class="lbl" style="margin-top:12px" data-page-node-id="aCx6UqoajDuickvJt3MeNk">释义（多义项用逗号分隔）</label>
+          <textarea id="editMeaning" class="textarea" rows="3"></textarea>
+          <label class="lbl" style="margin-top:12px" data-page-node-id="HrIPCqcNyWzoqFFVlDESiS">例句（可选）</label>
+          <input id="editExample" class="input" data-page-node-id="EfHqft9grS2IF7Gzf1nTO6" />
+          <div class="row gap" style="margin-top:12px" data-page-node-id="MI19MB5SiCJcI4UzyXQG6u">
+            <button class="btn primary" id="editSave" data-page-node-id="gsHCCsEFJtT6JSNm0D03en">保存</button>
+            <button class="btn ghost" id="editCancel" data-page-node-id="HTnETy5fr4Ttb8arqjAIb8">取消</button>
+            <span id="editScopeHint" class="muted small" data-page-node-id="nbtCLXBCI1rRgjJyPqGIpZ"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 浮动释义气泡 -->
+    <div id="bubble" class="bubble hidden" data-page-node-id="DdXicF9VaBe4UlvZndtM1s">
+      <div class="bubble-head" style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px">
+        <div class="bubble-word" data-page-node-id="N1szzVSaL1rj5Bb4UXS4XJ"></div>
+        <button class="btn-speak small" id="bubbleSpeak" type="button" title="朗读">🔊</button>
+      </div>
+      <div class="bubble-phonetic muted small" data-page-node-id="4Ct0xcEdkU0yfrpv6fMjXB"></div>
+      <div class="bubble-meaning" data-page-node-id="hoV7Sv4GhVw2k6afrzkCCp"></div>
+      <div class="bubble-example muted small" data-page-node-id="VoMhP9IBlJmiBl0MZJmq1f"></div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast hidden" data-page-node-id="smHjXOXOQp1FihQSL7yF7h"></div>
+  </div>
+
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

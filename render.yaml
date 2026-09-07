@@ -1,0 +1,12 @@
+# Render Blueprint —— 静态站（推荐，免费、无需 Node 进程与启动命令）
+# 在 Render 控制台 New + Blueprint 连接本仓库即可一键创建服务。
+services:
+  - type: web
+    name: ielts-vocab-workbench
+    runtime: static
+    buildCommand: ""
+    staticPublishPath: ./
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
