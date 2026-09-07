@@ -29,6 +29,13 @@
         <button class="tab" data-tab="article" data-page-node-id="l4FY5Ta7FNYX836kjyXazM">AI文章</button>
         <button class="tab" data-tab="stats" data-page-node-id="VeAPKUMcMdlOkrP6C7uQQE">统计</button>
       </nav>
+      <div class="cloud-status" id="cloudStatus" data-page-node-id="CsA1Bf9YHd7KjP2nQ5mVx8">
+        <span class="sync-indicator" id="syncIndicator" data-page-node-id="SyNcIn1D3c4T0Rp2Q5mVx9">
+          <span class="sync-dot offline" id="syncDot" data-page-node-id="SyNcDoT123XyZ0001"></span>
+          <span class="sync-text" id="syncText" data-page-node-id="SyNcTeX789AbC0002">未登录</span>
+        </span>
+        <button class="cloud-btn" id="cloudBtn" data-page-node-id="ClOuD123BtN00003">☁ 登录</button>
+      </div>
     </header>
 
     <main class="main" data-page-node-id="bmMU1Np2jGGbNOotuUzQBD">
@@ -307,9 +314,40 @@ apply | v. 申请,应用
 
     <!-- Toast -->
     <div id="toast" class="toast hidden" data-page-node-id="smHjXOXOQp1FihQSL7yF7h"></div>
+
+    <!-- 云端登录 Modal -->
+    <div id="loginModal" class="modal hidden" data-page-node-id="LgN1MoDaL9Md2aA3bC4dE5">
+      <div class="modal-mask" data-page-node-id="LgN1MoDaL9Md2aA3bC4dE6"></div>
+      <div class="modal-box" data-page-node-id="LgN1MoDaL9Md2aA3bC4dE7">
+        <h3 data-page-node-id="LgN1MoDaL9Md2aA3bC4dE8">☁ 云端同步</h3>
+        <p class="muted small" data-page-node-id="LgN1MoDaL9Md2aA3bC4dE9">登录后数据自动保存到云端，多设备共享；换设备登录账号即可看到所有数据。</p>
+        <div class="form-row" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF0">
+          <input id="loginEmail" type="email" class="input" placeholder="邮箱（首次即注册）" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF1" />
+        </div>
+        <div class="form-row" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF2">
+          <input id="loginPwd" type="password" class="input" placeholder="密码（至少 6 位）" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF3" />
+        </div>
+        <div class="modal-actions" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF4">
+          <button id="btnSignIn" class="btn-primary" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF5">登录</button>
+          <button id="btnSignUp" class="btn-secondary" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF6">注册新账号</button>
+          <button id="btnCloseLogin" class="btn-text" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF8">取消</button>
+        </div>
+        <p id="loginMsg" class="login-msg muted small" data-page-node-id="LgN1MoDaL9Md2aA3bC4dF9"></p>
+        <div id="loggedInPanel" class="hidden" data-page-node-id="LgN1MoDaL9Md2aA3bC4dG0">
+          <p data-page-node-id="LgN1MoDaL9Md2aA3bC4dG1">已登录：<b id="loggedInEmail" data-page-node-id="LgN1MoDaL9Md2aA3bC4dG2"></b></p>
+          <div class="modal-actions" data-page-node-id="LgN1MoDaL9Md2aA3bC4dG3">
+            <button id="btnMigrate" class="btn-secondary" data-page-node-id="LgN1MoDaL9Md2aA3bC4dG7">📤 迁移本地数据到云端</button>
+            <button id="btnSignOut" class="btn-secondary" data-page-node-id="LgN1MoDaL9Md2aA3bC4dG4">退出登录</button>
+            <button id="btnCloseLogin2" class="btn-text" data-page-node-id="LgN1MoDaL9Md2aA3bC4dG5">关闭</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="data.js"></script>
+  <script src="supabase.js"></script>
+  <script src="sync.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

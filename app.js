@@ -108,6 +108,8 @@
       }
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    // v5.8：登录后自动同步到云端（SYNC.schedule 内部 1.5s 防抖）
+    if (window.SYNC) window.SYNC.schedule(2000);
   }
 
   function hydrate() {
@@ -3218,4 +3220,175 @@
   }
 
   document.addEventListener('DOMContentLoaded', init);
+
+  /* ---------- 13. 云端同步（v5.8） ---------- */
+  function initCloud() {
+    const cloudBtn = $('#cloudBtn');
+    const cloudModal = $('#loginModal');
+    const dot = $('#syncDot');
+    const text = $('#syncText');
+    if (!cloudBtn || !cloudModal) return;
+
+    function setLoggedInUI(email) {
+      cloudBtn.textContent = email;
+      cloudBtn.classList.add('logged');
+      $('#loggedInEmail').textContent = email;
+      $('#loggedInPanel').classList.remove('hidden');
+      Array.from(cloudModal.querySelectorAll('.form-row, #loginMsg, #btnSignIn, #btnSignUp')).forEach(function (el) { el.style.display = 'none'; });
+      text.textContent = '已同步';
+      dot.className = 'sync-dot synced';
+    }
+    function setLoggedOutUI() {
+      cloudBtn.textContent = '☁ 登录';
+      cloudBtn.classList.remove('logged');
+      $('#loggedInPanel').classList.add('hidden');
+      Array.from(cloudModal.querySelectorAll('.form-row, #loginMsg, #btnSignIn, #btnSignUp')).forEach(function (el) { el.style.display = ''; });
+      text.textContent = '未登录';
+      dot.className = 'sync-dot offline';
+    }
+    function setMsg(msg, type) {
+      const m = $('#loginMsg');
+      m.textContent = msg || '';
+      m.className = 'login-msg muted small' + (type ? ' ' + type : '');
+    }
+    function showModal() { cloudModal.classList.remove('hidden'); }
+    function hideModal() { cloudModal.classList.add('hidden'); setMsg(''); }
+
+    cloudBtn.onclick = showModal;
+    $('#btnCloseLogin').onclick = hideModal;
+    $('#btnCloseLogin2').onclick = hideModal;
+    cloudModal.querySelector('.modal-mask').onclick = hideModal;
+
+    $('#btnSignIn').onclick = async function () {
+      const email = $('#loginEmail').value.trim();
+      const pwd = $('#loginPwd').value;
+      if (!email || !pwd) return setMsg('请输入邮箱和密码', 'error');
+      setMsg('登录中…');
+      try {
+        await window.SB.signIn(email, pwd);
+        await afterLogin();
+      } catch (e) {
+        setMsg('登录失败：' + (e.message || e), 'error');
+      }
+    };
+
+    $('#btnSignUp').onclick = async function () {
+      const email = $('#loginEmail').value.trim();
+      const pwd = $('#loginPwd').value;
+      if (!email || !pwd) return setMsg('请输入邮箱和密码', 'error');
+      if (pwd.length < 6) return setMsg('密码至少 6 位', 'error');
+      setMsg('注册中…');
+      try {
+        await window.SB.signUp(email, pwd);
+        await afterLogin();
+      } catch (e) {
+        setMsg('注册失败：' + (e.message || e), 'error');
+      }
+    };
+
+    $('#btnSignOut').onclick = async function () {
+      if (!confirm('退出登录？\n本地数据会保留；云端数据不会删除。')) return;
+      await window.SB.signOut();
+      setLoggedOutUI();
+      hideModal();
+      toast('已退出登录');
+    };
+
+    $('#btnMigrate').onclick = async function () {
+      setMsg('正在迁移本地数据到云端…');
+      try {
+        await window.SYNC.migrateToCloud();
+        setMsg('✓ 迁移成功！数据已上传到云端。', 'success');
+        toast('✓ 迁移成功');
+      } catch (e) {
+        setMsg('迁移失败：' + (e.message || e), 'error');
+      }
+    };
+
+    document.addEventListener('sb-sync-status', function (e) {
+      const s = e.detail;
+      if (s.status === 'syncing') { text.textContent = '同步中…'; dot.className = 'sync-dot syncing'; }
+      else if (s.status === 'error') { text.textContent = '同步失败'; dot.className = 'sync-dot error'; }
+      else if (s.status === 'idle' && s.lastSync) {
+        const t = new Date(s.lastSync);
+        const hh = t.getHours().toString().padStart(2, '0');
+        const mm = t.getMinutes().toString().padStart(2, '0');
+        text.textContent = '已同步 ' + hh + ':' + mm;
+        dot.className = 'sync-dot synced';
+      }
+    });
+
+    function applyCloudData(cloudData) {
+      state.books = cloudData.books || [];
+      state.wrongBook = cloudData.wrongBook || [];
+      state.userDict = cloudData.userDict || {};
+      if (cloudData.prefs) {
+        state.autoSpeak = cloudData.prefs.autoSpeak !== false;
+        state.wrongFilter = cloudData.prefs.wrongFilter || 'all';
+        state.reviewFilter = cloudData.prefs.reviewFilter || 'all';
+      }
+      state.lastStudy = cloudData.lastStudy || null;
+      state.lastSpell = cloudData.lastSpell || null;
+      state.lastListen = cloudData.lastListen || null;
+      persist();
+    }
+
+    async function afterLogin() {
+      const u = window.SB.getUser();
+      if (!u) {
+        setMsg('注册成功！请查收邮箱完成确认（如果开启了邮箱确认）', 'success');
+        return;
+      }
+      setMsg('正在拉取云端数据…');
+      try {
+        const cloudData = await window.SYNC.pullFromCloud();
+        const hasCloud = cloudData && cloudData.books && cloudData.books.length > 0;
+        const hasLocal = state.books && state.books.length > 0;
+        if (hasCloud && !hasLocal) {
+          applyCloudData(cloudData);
+          location.reload();
+          return;
+        } else if (hasLocal && !hasCloud) {
+          setMsg('本地有数据，自动上传到云端…');
+          await window.SYNC.migrateToCloud();
+          setMsg('✓ 本地数据已上传到云端', 'success');
+        } else if (hasLocal && hasCloud) {
+          const choice = confirm('本地与云端都有数据。\n\n确定 = 上传本地到云端（覆盖云端）\n取消 = 保留本地，下载云端到本地');
+          if (choice) {
+            await window.SYNC.migrateToCloud();
+            setMsg('✓ 本地数据已上传到云端', 'success');
+          } else {
+            applyCloudData(cloudData);
+            location.reload();
+            return;
+          }
+        }
+        window.SYNC.setEnabled(true);
+        setLoggedInUI(u.email);
+        setMsg('✓ 登录成功，已开启云端同步', 'success');
+        setTimeout(hideModal, 1000);
+      } catch (e) {
+        setMsg('拉取云端数据失败：' + (e.message || e), 'error');
+      }
+    }
+
+    // 检查是否已登录
+    if (window.SB.isLoggedIn()) {
+      const u = window.SB.getUser();
+      setLoggedInUI(u.email);
+      window.SYNC.setEnabled(true);
+      window.SYNC.pullFromCloud().then(function (cloudData) {
+        if (cloudData && cloudData.books && cloudData.books.length > 0 && state.books.length === 0) {
+          applyCloudData(cloudData);
+          location.reload();
+        }
+      }).catch(function (e) { console.warn('pull from cloud failed', e); });
+    } else {
+      setLoggedOutUI();
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    setTimeout(initCloud, 50);
+  });
 })();
