@@ -179,12 +179,14 @@
     if (!t) return true;
     return /释义待补|待补全|可点击编辑|n\.\/v\.\s*$/i.test(t);
   }
-  function toast(msg) {
+  function toast(msg, type, duration) {
     const el = $('#toast');
     el.textContent = msg;
-    el.classList.remove('hidden');
+    el.classList.remove('hidden', 'toast-error', 'toast-success');
+    if (type === 'error') el.classList.add('toast-error');
+    else if (type === 'success') el.classList.add('toast-success');
     clearTimeout(toast._t);
-    toast._t = setTimeout(() => el.classList.add('hidden'), 1800);
+    toast._t = setTimeout(() => el.classList.add('hidden'), duration || 1800);
   }
 
   /* ---------- 1.5 语音合成（Web Speech API） ---------- */
@@ -3309,13 +3311,26 @@
     document.addEventListener('sb-sync-status', function (e) {
       const s = e.detail;
       if (s.status === 'syncing') { text.textContent = '同步中…'; dot.className = 'sync-dot syncing'; }
-      else if (s.status === 'error') { text.textContent = '同步失败'; dot.className = 'sync-dot error'; }
+      else if (s.status === 'error') {
+        text.textContent = '同步失败';
+        dot.className = 'sync-dot error';
+        // 显示具体错误（方便排查）
+        if (s.lastError) toast('✗ 同步失败：' + (s.lastError.length > 80 ? s.lastError.slice(0, 80) + '…' : s.lastError), 'error', 5000);
+      }
       else if (s.status === 'idle' && s.lastSync) {
         const t = new Date(s.lastSync);
         const hh = t.getHours().toString().padStart(2, '0');
         const mm = t.getMinutes().toString().padStart(2, '0');
         text.textContent = '已同步 ' + hh + ':' + mm;
         dot.className = 'sync-dot synced';
+      }
+    });
+
+    // 同步进度事件（多本书并发时显示 "同步中 2/4"）
+    document.addEventListener('sb-sync-progress', function (e) {
+      const p = e.detail;
+      if (p && p.total > 1 && p.done < p.total) {
+        text.textContent = '同步中 ' + p.done + '/' + p.total;
       }
     });
 

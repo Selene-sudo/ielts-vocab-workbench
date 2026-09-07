@@ -333,6 +333,8 @@ body {
   transition: opacity 0.2s, transform 0.2s;
 }
 .toast.hidden { opacity: 0; pointer-events: none; transform: translate(-50%, 8px); }
+.toast.toast-error { background: rgba(217, 45, 32, 0.95); max-width: 480px; white-space: pre-wrap; text-align: left; line-height: 1.45; padding: 12px 20px; border-radius: 12px; }
+.toast.toast-success { background: rgba(15, 110, 86, 0.95); }
 
 /* ===== 错词条 ===== */
 .wrong-row {
