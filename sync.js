@@ -21,7 +21,46 @@
     syncTimer = setTimeout(function () { syncNow(); }, delay || 1500);
   }
 
-  function fmtDate(d) { try { return d ? new Date(d).toISOString() : null; } catch (e) { return null; } }
+  function fmtDate(d) { try { return d ? new Date(d).toISOString() : null; } catch (e) { null; } }
+
+  // ====== 单本书同步（独立函数，便于并发） ======
+  async function syncBook(book, userId) {
+    let bid = book.id;
+    try {
+      await window.SB.upsert('vocab_books', {
+        id: bid, user_id: userId, name: book.name,
+        source: book.source || 'manual',
+        created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
+      }, 'id');
+    } catch (e) {
+      if ((e.message || '').includes('row-level security policy')) {
+        // 换一个全局唯一 id 重试，并记住映射
+        const oldId = bid;
+        bid = 'b_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+        await window.SB.upsert('vocab_books', {
+          id: bid, user_id: userId, name: book.name,
+          source: book.source || 'manual',
+          created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
+        }, 'id');
+        book._idChanged = { from: oldId, to: bid };
+      } else {
+        throw e;
+      }
+    }
+    // 重建该书的 words（删除后插入，简化逻辑）
+    await window.SB.remove('vocab_words', { book_id: bid });
+    if (book.words && book.words.length) {
+      const rows = book.words.map(function (w) {
+        return {
+          book_id: bid, word: w.word, type: w.type || null,
+          meaning: w.meaning || null, example: w.example || null,
+          mastered: !!w.mastered, srs: w.srs || null,
+          added_at: fmtDate(w.addedAt) || fmtDate(Date.now())
+        };
+      });
+      await window.SB.insert('vocab_words', rows);
+    }
+  }
 
   // ====== 上传 state 到云端 ======
   async function syncNow() {
@@ -30,76 +69,46 @@
     if (syncStatus === 'syncing') return;
     syncStatus = 'syncing';
     notify();
+    const startTs = Date.now();
     try {
       const s = window.state;
       const userId = window.SB.getUser().id;
 
-      // 1) books
-      // 若本地 book.id 在云端已被其他用户占用，生成新 id 避免 RLS 冲突
-      const bookIdMap = {};
-      for (const book of (s.books || [])) {
-        let bid = book.id;
-        try {
-          await window.SB.upsert('vocab_books', {
-            id: bid, user_id: userId, name: book.name,
-            source: book.source || 'manual',
-            created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
-          }, 'id');
-        } catch (e) {
-          if ((e.message || '').includes('row-level security policy')) {
-            // 换一个全局唯一 id 重试，并记住映射
-            const oldId = bid;
-            bid = 'b_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
-            await window.SB.upsert('vocab_books', {
-              id: bid, user_id: userId, name: book.name,
-              source: book.source || 'manual',
-              created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
-            }, 'id');
-            bookIdMap[oldId] = bid;
-          } else {
-            throw e;
-          }
-        }
-        // 更新本地 book id（如果变了）
-        if (bookIdMap[book.id]) {
-          book.id = bookIdMap[book.id];
-        }
-        // 重建该书的 words（删除后插入，简化逻辑）
-        await window.SB.remove('vocab_words', { book_id: bid });
-        // 同步更新 words 里的 book_id（一般 words 里没有 book_id，但以防万一）
-        if (book.words) {
-          for (const w of book.words) { w.book_id = bid; }
-        }
-        if (book.words && book.words.length) {
-          const rows = book.words.map(function (w) {
-            return {
-              book_id: book.id, word: w.word, type: w.type || null,
-              meaning: w.meaning || null, example: w.example || null,
-              mastered: !!w.mastered, srs: w.srs || null,
-              added_at: fmtDate(w.addedAt) || fmtDate(Date.now())
-            };
-          });
-          await window.SB.insert('vocab_words', rows);
-        }
+      // 1) books + words（多本书并发同步）
+      const books = s.books || [];
+      const totalBooks = books.length;
+      let doneBooks = 0;
+      const updateProgress = function () {
+        document.dispatchEvent(new CustomEvent('sb-sync-progress', { detail: { done: doneBooks, total: totalBooks, phase: 'books' } }));
+      };
+      updateProgress();
+      // 清除 _idChanged 标记
+      for (const b of books) { delete b._idChanged; }
+      // 关键优化：多本书并发同步（Promise.all），速度提升 N 倍
+      const bookResults = await Promise.allSettled(books.map(function (book) {
+        return syncBook(book, userId).then(function () {
+          doneBooks++;
+          updateProgress();
+        });
+      }));
+      // 检查是否有失败
+      const bookFails = bookResults.filter(function (r) { return r.status === 'rejected'; });
+      if (bookFails.length) {
+        throw new Error(bookFails.length + ' 本书同步失败: ' + (bookFails[0].reason?.message || 'unknown'));
+      }
+      // 应用 id 变更映射
+      for (const book of books) {
+        if (book._idChanged) { book.id = book._idChanged.to; delete book._idChanged; }
       }
       // 删除云端已不存在的 books（级联删 words）
       const remoteBooks = await window.SB.select('vocab_books', '?user_id=eq.' + userId + '&select=id');
-      const localIds = new Set((s.books || []).map(function (b) { return b.id; }));
-      for (const rb of (remoteBooks || [])) {
-        if (!localIds.has(rb.id)) await window.SB.remove('vocab_books', { id: rb.id });
+      const localIds = new Set(books.map(function (b) { return b.id; }));
+      const toDelete = (remoteBooks || []).filter(function (rb) { return !localIds.has(rb.id); });
+      if (toDelete.length) {
+        await Promise.all(toDelete.map(function (rb) { return window.SB.remove('vocab_books', { id: rb.id }); }));
       }
 
       // 2) wrong_book
-      // 先把 sources 里旧的 bookId 替换成新生成的 id
-      if (Object.keys(bookIdMap).length) {
-        for (const w of (s.wrongBook || [])) {
-          if (!w.sources) continue;
-          for (const src of w.sources) {
-            if (src.bookId && bookIdMap[src.bookId]) src.bookId = bookIdMap[src.bookId];
-            if (src.sourceBookId && bookIdMap[src.sourceBookId]) src.sourceBookId = bookIdMap[src.sourceBookId];
-          }
-        }
-      }
       await window.SB.remove('wrong_book', { user_id: userId });
       if (s.wrongBook && s.wrongBook.length) {
         const rows = s.wrongBook.map(function (w) {
@@ -129,6 +138,8 @@
         last_listen: s.lastListen || null
       }, 'user_id');
 
+      const elapsed = Date.now() - startTs;
+      console.log('SYNC ok in ' + elapsed + 'ms');
       lastSync = Date.now();
       lastError = null;
       syncStatus = 'idle';
