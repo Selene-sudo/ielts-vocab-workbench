@@ -3152,6 +3152,7 @@
   /* ---------- 11. 启动 ---------- */
   function init() {
     hydrate();
+    window.state = state; // 暴露给同步层 (sync.js)
     // v5：恢复上次活动的词本 + 错词会话标志
     if (state.lastStudy?.activeBookId && state.books.find(b => b.id === state.lastStudy.activeBookId)) {
       state.activeBookId = state.lastStudy.activeBookId;
