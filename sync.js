@@ -35,14 +35,41 @@
       const userId = window.SB.getUser().id;
 
       // 1) books
+      // 若本地 book.id 在云端已被其他用户占用，生成新 id 避免 RLS 冲突
+      const bookIdMap = {};
       for (const book of (s.books || [])) {
-        await window.SB.upsert('vocab_books', {
-          id: book.id, user_id: userId, name: book.name,
-          source: book.source || 'manual',
-          created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
-        }, 'id');
+        let bid = book.id;
+        try {
+          await window.SB.upsert('vocab_books', {
+            id: bid, user_id: userId, name: book.name,
+            source: book.source || 'manual',
+            created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
+          }, 'id');
+        } catch (e) {
+          if ((e.message || '').includes('row-level security policy')) {
+            // 换一个全局唯一 id 重试，并记住映射
+            const oldId = bid;
+            bid = 'b_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+            await window.SB.upsert('vocab_books', {
+              id: bid, user_id: userId, name: book.name,
+              source: book.source || 'manual',
+              created_at: fmtDate(book.createdAt) || fmtDate(Date.now())
+            }, 'id');
+            bookIdMap[oldId] = bid;
+          } else {
+            throw e;
+          }
+        }
+        // 更新本地 book id（如果变了）
+        if (bookIdMap[book.id]) {
+          book.id = bookIdMap[book.id];
+        }
         // 重建该书的 words（删除后插入，简化逻辑）
-        await window.SB.remove('vocab_words', { book_id: book.id });
+        await window.SB.remove('vocab_words', { book_id: bid });
+        // 同步更新 words 里的 book_id（一般 words 里没有 book_id，但以防万一）
+        if (book.words) {
+          for (const w of book.words) { w.book_id = bid; }
+        }
         if (book.words && book.words.length) {
           const rows = book.words.map(function (w) {
             return {
@@ -63,6 +90,16 @@
       }
 
       // 2) wrong_book
+      // 先把 sources 里旧的 bookId 替换成新生成的 id
+      if (Object.keys(bookIdMap).length) {
+        for (const w of (s.wrongBook || [])) {
+          if (!w.sources) continue;
+          for (const src of w.sources) {
+            if (src.bookId && bookIdMap[src.bookId]) src.bookId = bookIdMap[src.bookId];
+            if (src.sourceBookId && bookIdMap[src.sourceBookId]) src.sourceBookId = bookIdMap[src.sourceBookId];
+          }
+        }
+      }
       await window.SB.remove('wrong_book', { user_id: userId });
       if (s.wrongBook && s.wrongBook.length) {
         const rows = s.wrongBook.map(function (w) {
