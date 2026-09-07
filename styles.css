@@ -1029,6 +1029,7 @@ body {
   justify-content: center;
 }
 .modal.hidden { display: none; }
+.hidden { display: none !important; }
 .modal-mask {
   position: absolute;
   inset: 0;
