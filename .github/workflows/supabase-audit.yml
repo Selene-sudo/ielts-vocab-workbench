@@ -1,6 +1,6 @@
 # Supabase 数据同步体检（一次性）
 # 触发方式：Actions → Supabase Sync Audit → Run workflow（输入邮箱与密码）
-# 说明：凭据仅作为 workflow_dispatch 入参传入，不写入仓库；脚本不打印密码
+# 凭据仅通过 workflow_dispatch 入参传入，不写入仓库
 name: Supabase Sync Audit
 
 on:
@@ -16,7 +16,7 @@ on:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
       - name: Audit cloud data
         shell: bash
@@ -26,94 +26,125 @@ jobs:
           SB_EMAIL: ${{ github.event.inputs.email }}
           SB_PASS: ${{ github.event.inputs.password }}
         run: |
-          echo "=== 1. 登录 ==="
-          LOGIN=$(curl -sS -X POST "$SB_URL/auth/v1/token?grant_type=password" \
-            -H "apikey: $SB_KEY" -H "Content-Type: application/json" \
-            -d "{\"email\":\"$SB_EMAIL\",\"password\":\"$SB_PASS\"}")
-          TOK=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('access_token',''))" 2>/dev/null)
-          SUID=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('user',{}).get('id',''))" 2>/dev/null)
-          if [ -z "$TOK" ]; then echo "@@LOGIN_FAILED"; echo "$LOGIN" | head -c 300; exit 1; fi
-          echo "@@USER_ID=$SUID"
+          python3 - <<'PYCODE'
+          import json, os, urllib.request, urllib.error, time
 
-          count_rows() {
-            # $1 = table, $2 = filter (e.g. "user_id=eq.$SUID")
-            local h
-            h=$(curl -sS -I "$SB_URL/rest/v1/$1?$2&select=id" \
-                  -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" \
-                  -H "Prefer: count=exact" 2>/dev/null | tr -d '\r' | grep -i '^content-range:' | head -1)
-            echo "$h" | sed -E 's#.*/([0-9]+)$#\1#'
-          }
+          URL = os.environ['SB_URL'].rstrip('/')
+          KEY = os.environ['SB_KEY']
+          EMAIL = os.environ['SB_EMAIL']
+          PASS = os.environ['SB_PASS']
 
-          echo "=== 2. 该用户各表行数 ==="
-          printf "@@COUNT books=%s\n"      "$(count_rows vocab_books  "user_id=eq.$SUID")"
-          printf "@@COUNT wrong_book=%s\n" "$(count_rows wrong_book   "user_id=eq.$SUID")"
-          printf "@@COUNT user_dict=%s\n"  "$(count_rows user_dict    "user_id=eq.$SUID")"
-          printf "@@COUNT user_state=%s\n" "$(count_rows user_state   "user_id=eq.$SUID")"
+          def p(tag, s):
+              print('@@%s\t%s' % (tag, s), flush=True)
 
-          echo "=== 3. 单词本明细与每本书的单词数 ==="
-          BOOKS=$(curl -sS "$SB_URL/rest/v1/vocab_books?user_id=eq.$SUID&select=id,name,created_at" \
-                  -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK")
-          echo "$BOOKS" | python3 -c "
-          import json,sys
+          def http(method, path, headers=None, body=None, timeout=60):
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request(URL + path, method=method, data=body)
+                      req.add_header('apikey', KEY)
+                      for k, v in (headers or {}).items():
+                          req.add_header(k, v)
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          return r.status, dict(r.headers), r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code >= 500 and attempt < 3:
+                          time.sleep(2); continue
+                      return e.code, dict(e.headers or {}), e.read()
+                  except Exception as e:
+                      if attempt < 3:
+                          time.sleep(2); continue
+                      return -1, {}, str(e).encode()
+              return -1, {}, b''
+
+          # ---------- 1. 登录 ----------
+          st, hd, bd = http('POST', '/auth/v1/token?grant_type=password',
+                            {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + KEY},
+                            json.dumps({'email': EMAIL, 'password': PASS}).encode())
           try:
-              bs=json.load(sys.stdin)
-          except Exception as e:
-              print('@@BOOKS_PARSE_ERROR', e); sys.exit()
-          for b in bs: print('@@BOOK\t%s\t%s\t%s' % (b.get('name',''), b.get('id',''), b.get('created_at','')[:10]))
-          " || true
+              login = json.loads(bd or b'{}')
+          except Exception:
+              login = {}
+          TOK = login.get('access_token') or ''
+          SUID = (login.get('user') or {}).get('id') or ''
+          if not TOK:
+              p('LOGIN_FAILED', (bd or b'')[:200])
+              raise SystemExit(1)
+          p('USER_ID', SUID)
+          AUTH = {'Authorization': 'Bearer ' + TOK}
 
-          if [ -z "$SUID" ]; then exit 1; fi
-          for BID in $(echo "$BOOKS" | python3 -c "
-          import json,sys
-          try:
-            [print(b['id']) for b in json.load(sys.stdin)]
-          except: pass
-          "); do
-            N=$(curl -sS -I "$SB_URL/rest/v1/vocab_words?book_id=eq.$BID&select=id" \
-                  -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" \
-                  -H "Prefer: count=exact" 2>/dev/null | tr -d '\r' | grep -i '^content-range:' | head -1 | sed -E 's#.*/([0-9]+)$#\1#')
-            printf "@@WORDS_OF_BOOK\t%s\t%s\n" "$BID" "${N:-?}"
-          done
+          def rows_count(table, qs):
+              st, hd, bd = http('GET', '/rest/v1/%s?%s' % (table, qs),
+                                dict(AUTH, **{'Prefer': 'count=exact', 'Range': '0-0'}))
+              cr = hd.get('Content-Range') or hd.get('content-range') or ''
+              total = cr.split('/')[-1] if '/' in cr else '?'
+              return st, total, bd
 
-          echo "=== 4. vocab_words 字段检查（还原备份脚本当初的查询） ==="
-          FIRST_BOOK=$(echo "$BOOKS" | python3 -c "
-          import json,sys
-          try: print(json.load(sys.stdin)[0].get('id',''))
-          except: print('')
-          ")
-          if [ -n "$FIRST_BOOK" ]; then
-            echo "--- 备份脚本原样查询 select=word,type,meaning,example,mastered,srs,added_at ---"
-            curl -sS -w "\n@@HTTP=%{http_code}\n" \
-              "$SB_URL/rest/v1/vocab_words?book_id=eq.$FIRST_BOOK&select=word,type,meaning,example,mastered,srs,added_at&limit=1" \
-              -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 600
-            echo "--- 宽松查询 select=* ---"
-            curl -sS -w "\n@@HTTP=%{http_code}\n" \
-              "$SB_URL/rest/v1/vocab_words?book_id=eq.$FIRST_BOOK&select=*&limit=1" \
-              -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 600
-          fi
+          def rows_get(table, qs):
+              st, hd, bd = http('GET', '/rest/v1/%s?%s' % (table, qs), AUTH)
+              try:
+                  return st, json.loads(bd or b'[]')
+              except Exception:
+                  return st, (bd or b'')[:200]
 
-          echo "=== 5. 最近 5 条错词（确认数据内容） ==="
-          curl -sS "$SB_URL/rest/v1/wrong_book?user_id=eq.$SUID&select=word,meaning,correct_count,updated_at&order=updated_at.desc&limit=5" \
-            -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 700
+          # ---------- 2. 各表行数 ----------
+          for t, key in [('vocab_books', 'user_id'), ('wrong_book', 'word'),
+                         ('user_dict', 'word'), ('user_state', 'user_id')]:
+              st, total, bd = rows_count(t, 'user_id=eq.%s&select=%s' % (SUID, key))
+              p('COUNT', '%s=%s (http=%s)' % (t, total, st))
 
-          echo "=== 6. user_state 关键字段 ==="
-          curl -sS "$SB_URL/rest/v1/user_state?user_id=eq.$SUID" \
-            -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | python3 -c "
-          import json,sys
-          try:
-            rows=json.load(sys.stdin)
-          except Exception as e:
-            print('parse error', e); sys.exit()
-          for r in rows:
-            keys=list(r.keys())
-            print('@@STATE_KEYS', ','.join(keys))
-            for k in keys:
-              v=r[k]
-              if k=='user_id' or v is None: continue
-              s=json.dumps(v, ensure_ascii=False) if not isinstance(v,str) else v
-              print('@@STATE_SIZE\t%s\t%s' % (k, len(s)))
-              if k in ('last_study_map','last_spell_map','last_listen_map'):
-                try:
-                  print('@@STATE_MAPKEYS\t%s\t%s' % (k, ','.join(list(json.loads(s).keys()) if isinstance(v,str) else list(v.keys()))))
-                except Exception: pass
-          " || true
+          # ---------- 3. 单词本 + 每本书单词数 ----------
+          st, books = rows_get('vocab_books',
+                               'user_id=eq.%s&select=id,name,source,created_at&order=created_at' % SUID)
+          if isinstance(books, list):
+              total_words = 0
+              for b in books:
+                  stt, n, _b = rows_count('vocab_words', 'book_id=eq.%s&select=word' % b['id'])
+                  try:
+                      total_words += int(n)
+                  except Exception:
+                      pass
+                  p('BOOK', '%s\t%s\twords=%s\tcreated=%s' % (
+                      b.get('name', ''), b.get('id', ''), n, (b.get('created_at') or '')[:10]))
+              p('COUNT', 'vocab_words(合计)=%d' % total_words)
+
+              # ---------- 4. 单词抽样 ----------
+              for b in books[:4]:
+                  st, rows = rows_get('vocab_words',
+                                      'book_id=eq.%s&select=word,type,meaning,mastered&limit=3' % b['id'])
+                  sample = json.dumps(rows, ensure_ascii=False)[:260] if isinstance(rows, list) else rows
+                  p('WORDS_SAMPLE', '%s -> %s' % (b.get('name', ''), sample))
+
+          # ---------- 5. 错词 ----------
+          st, wrong = rows_get('wrong_book',
+                               'user_id=eq.%s&select=word,meaning,correct_count,last_seen&limit=500' % SUID)
+          if isinstance(wrong, list):
+              p('WRONG_COUNT', len(wrong))
+              bad = sum(1 for w in wrong if not (w.get('meaning') or '').strip())
+              p('WRONG_NO_MEANING', bad)
+              for w in wrong[:6]:
+                  p('WRONG', '%s | %s | correct=%s' % (
+                      w.get('word'), (w.get('meaning') or '(空)')[:24], w.get('correct_count')))
+
+          # ---------- 6. user_state ----------
+          st, state = rows_get('user_state', 'user_id=eq.%s&select=*' % SUID)
+          if isinstance(state, list) and state:
+              r = state[0]
+              p('STATE_KEYS', ','.join(r.keys()))
+              for k, v in r.items():
+                  if k == 'user_id' or v is None:
+                      continue
+                  s = json.dumps(v, ensure_ascii=False)
+                  p('STATE_SIZE', '%s\t%d chars' % (k, len(s)))
+                  if k in ('last_study', 'last_spell', 'last_listen') and isinstance(v, dict):
+                      p('STATE_%s_TOPKEYS' % k, ','.join(list(v.keys())[:12]))
+                  if k == 'prefs':
+                      p('STATE_PREFS', s[:160])
+              p('STATE_UPDATED_AT', r.get('updated_at', '?'))
+          else:
+              p('STATE', 'none or %s' % state)
+
+          # ---------- 7. 用户词典 ----------
+          st, ud = rows_get('user_dict', 'user_id=eq.%s&select=word,entry&limit=5' % SUID)
+          p('USER_DICT', json.dumps(ud, ensure_ascii=False)[:220] if isinstance(ud, list) else ud)
+          print('@@DONE', flush=True)
+          PYCODE
