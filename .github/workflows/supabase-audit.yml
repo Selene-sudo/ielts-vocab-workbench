@@ -1,0 +1,119 @@
+# Supabase 数据同步体检（一次性）
+# 触发方式：Actions → Supabase Sync Audit → Run workflow（输入邮箱与密码）
+# 说明：凭据仅作为 workflow_dispatch 入参传入，不写入仓库；脚本不打印密码
+name: Supabase Sync Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: 'Supabase login email'
+        required: true
+      password:
+        description: 'Supabase login password'
+        required: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Audit cloud data
+        shell: bash
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SB_EMAIL: ${{ github.event.inputs.email }}
+          SB_PASS: ${{ github.event.inputs.password }}
+        run: |
+          echo "=== 1. 登录 ==="
+          LOGIN=$(curl -sS -X POST "$SB_URL/auth/v1/token?grant_type=password" \
+            -H "apikey: $SB_KEY" -H "Content-Type: application/json" \
+            -d "{\"email\":\"$SB_EMAIL\",\"password\":\"$SB_PASS\"}")
+          TOK=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('access_token',''))" 2>/dev/null)
+          UID=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('user',{}).get('id',''))" 2>/dev/null)
+          if [ -z "$TOK" ]; then echo "@@LOGIN_FAILED"; echo "$LOGIN" | head -c 300; exit 1; fi
+          echo "@@USER_ID=$UID"
+
+          count_rows() {
+            # $1 = table, $2 = filter (e.g. "user_id=eq.$UID")
+            local h
+            h=$(curl -sS -I "$SB_URL/rest/v1/$1?$2&select=id" \
+                  -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" \
+                  -H "Prefer: count=exact" 2>/dev/null | tr -d '\r' | grep -i '^content-range:' | head -1)
+            echo "$h" | sed -E 's#.*/([0-9]+)$#\1#'
+          }
+
+          echo "=== 2. 该用户各表行数 ==="
+          printf "@@COUNT books=%s\n"      "$(count_rows vocab_books  "user_id=eq.$UID")"
+          printf "@@COUNT wrong_book=%s\n" "$(count_rows wrong_book   "user_id=eq.$UID")"
+          printf "@@COUNT user_dict=%s\n"  "$(count_rows user_dict    "user_id=eq.$UID")"
+          printf "@@COUNT user_state=%s\n" "$(count_rows user_state   "user_id=eq.$UID")"
+
+          echo "=== 3. 单词本明细与每本书的单词数 ==="
+          BOOKS=$(curl -sS "$SB_URL/rest/v1/vocab_books?user_id=eq.$UID&select=id,name,created_at" \
+                  -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK")
+          echo "$BOOKS" | python3 -c "
+          import json,sys
+          try:
+              bs=json.load(sys.stdin)
+          except Exception as e:
+              print('@@BOOKS_PARSE_ERROR', e); sys.exit()
+          for b in bs: print('@@BOOK\t%s\t%s\t%s' % (b.get('name',''), b.get('id',''), b.get('created_at','')[:10]))
+          " || true
+
+          if [ -z "$UID" ]; then exit 1; fi
+          for BID in $(echo "$BOOKS" | python3 -c "
+          import json,sys
+          try:
+            [print(b['id']) for b in json.load(sys.stdin)]
+          except: pass
+          "); do
+            N=$(curl -sS -I "$SB_URL/rest/v1/vocab_words?book_id=eq.$BID&select=id" \
+                  -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" \
+                  -H "Prefer: count=exact" 2>/dev/null | tr -d '\r' | grep -i '^content-range:' | head -1 | sed -E 's#.*/([0-9]+)$#\1#')
+            printf "@@WORDS_OF_BOOK\t%s\t%s\n" "$BID" "${N:-?}"
+          done
+
+          echo "=== 4. vocab_words 字段检查（还原备份脚本当初的查询） ==="
+          FIRST_BOOK=$(echo "$BOOKS" | python3 -c "
+          import json,sys
+          try: print(json.load(sys.stdin)[0].get('id',''))
+          except: print('')
+          ")
+          if [ -n "$FIRST_BOOK" ]; then
+            echo "--- 备份脚本原样查询 select=word,type,meaning,example,mastered,srs,added_at ---"
+            curl -sS -w "\n@@HTTP=%{http_code}\n" \
+              "$SB_URL/rest/v1/vocab_words?book_id=eq.$FIRST_BOOK&select=word,type,meaning,example,mastered,srs,added_at&limit=1" \
+              -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 600
+            echo "--- 宽松查询 select=* ---"
+            curl -sS -w "\n@@HTTP=%{http_code}\n" \
+              "$SB_URL/rest/v1/vocab_words?book_id=eq.$FIRST_BOOK&select=*&limit=1" \
+              -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 600
+          fi
+
+          echo "=== 5. 最近 5 条错词（确认数据内容） ==="
+          curl -sS "$SB_URL/rest/v1/wrong_book?user_id=eq.$UID&select=word,meaning,correct_count,updated_at&order=updated_at.desc&limit=5" \
+            -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 700
+
+          echo "=== 6. user_state 关键字段 ==="
+          curl -sS "$SB_URL/rest/v1/user_state?user_id=eq.$UID" \
+            -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | python3 -c "
+          import json,sys
+          try:
+            rows=json.load(sys.stdin)
+          except Exception as e:
+            print('parse error', e); sys.exit()
+          for r in rows:
+            keys=list(r.keys())
+            print('@@STATE_KEYS', ','.join(keys))
+            for k in keys:
+              v=r[k]
+              if k=='user_id' or v is None: continue
+              s=json.dumps(v, ensure_ascii=False) if not isinstance(v,str) else v
+              print('@@STATE_SIZE\t%s\t%s' % (k, len(s)))
+              if k in ('last_study_map','last_spell_map','last_listen_map'):
+                try:
+                  print('@@STATE_MAPKEYS\t%s\t%s' % (k, ','.join(list(json.loads(s).keys()) if isinstance(v,str) else list(v.keys()))))
+                except Exception: pass
+          " || true
