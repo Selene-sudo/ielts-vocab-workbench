@@ -30,6 +30,7 @@
         <button class="tab" data-tab="stats" data-page-node-id="VeAPKUMcMdlOkrP6C7uQQE">统计</button>
       </nav>
       <div class="cloud-status" id="cloudStatus" data-page-node-id="CsA1Bf9YHd7KjP2nQ5mVx8">
+        <button class="audio-toggle" id="audioToggle" type="button" title="关闭 / 开启朗读音频">🔊</button>
         <span class="sync-indicator" id="syncIndicator" data-page-node-id="SyNcIn1D3c4T0Rp2Q5mVx9">
           <span class="sync-dot offline" id="syncDot" data-page-node-id="SyNcDoT123XyZ0001"></span>
           <span class="sync-text" id="syncText" data-page-node-id="SyNcTeX789AbC0002">未登录</span>
@@ -152,6 +153,8 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
             <select id="reviewBookPicker" class="select" style="min-width:180px"></select>
             <button class="btn primary" id="reviewStartSpell" data-page-node-id="icnvT7hX3pcJYb4uCYYV8D">✍ 拼写今日到期词</button>
             <button class="btn" id="reviewStartAllSpell" data-page-node-id="icnvT7hX3pcJYb4uCYYV8E">✍ 拼写全部（含未到期）</button>
+            <button class="btn" id="reviewStartListen" type="button">🔊 听音（按当前范围）</button>
+            <button class="btn" id="reviewStartWrong" type="button">🔥 复习错词（按当前范围）</button>
           </div>
         </div>
         <div id="reviewArea" data-page-node-id="icnvT7hX3pcJYb4uCYYV8F"></div>
@@ -295,6 +298,7 @@ apply | v. 申请,应用
           <div class="row gap" style="margin-top:12px" data-page-node-id="MI19MB5SiCJcI4UzyXQG6u">
             <button class="btn primary" id="editSave" data-page-node-id="gsHCCsEFJtT6JSNm0D03en">保存</button>
             <button class="btn ghost" id="editCancel" data-page-node-id="HTnETy5fr4Ttb8arqjAIb8">取消</button>
+            <button class="btn ghost danger" id="editDelete" type="button" title="把这个词从单词本 / 错词本里彻底删除">🗑 删除这个词</button>
             <span id="editScopeHint" class="muted small" data-page-node-id="nbtCLXBCI1rRgjJyPqGIpZ"></span>
           </div>
         </div>

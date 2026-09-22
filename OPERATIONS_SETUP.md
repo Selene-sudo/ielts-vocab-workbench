@@ -3,7 +3,7 @@
 本文档说明如何部署两个自动化任务：
 
 1. **GitHub Actions 防休眠** — 每 3 天自动 ping 一次 Supabase
-2. **本地定时备份** — 每周日 3:00 自动备份到 `~/Documents/ielts-vocab-backups/`
+2. **本地定时备份** — 每周日 3:00 自动备份到 `~/Documents/工作台备份/`（Finder 显示为「用户/selene/文稿/工作台备份」）
 
 ---
 
@@ -98,7 +98,7 @@ launchctl start com.user.ielts-vocab-backup
 看输出：
 - `✅ 登录成功` 或 `✅ user_id=...`（登录通过）
 - `📥 拉取单词本/单词/错词...`（数据拉取）
-- `💾 写入备份文件：/Users/selene/Documents/ielts-vocab-backups/vocab-backup-20260907-193800.json`
+- `💾 写入备份文件：/Users/selene/Documents/工作台备份/vocab-backup-20260907-193800.json`
 
 ### 2.4 启用 launchd 定时任务
 
@@ -116,15 +116,15 @@ launchctl unload ~/Library/LaunchAgents/com.user.ielts-vocab-backup.plist
 ### 2.5 备份目录
 
 ```
-~/Documents/ielts-vocab-backups/
-├── vocab-backup-20260907-030000.json   ← 最早保留
-├── vocab-backup-20260914-030000.json
+~/Documents/工作台备份/   （Finder 中显示为「用户 > selene > 文稿 > 工作台备份」）
+├── vocab-backup-20260831-030000.json   ← 最早保留
+├── vocab-backup-20260901-030000.json
 ├── ...
-└── vocab-backup-20270107-030000.json   ← 最新
+└── vocab-backup-20260907-030000.json   ← 最新
 ├── backup.log                          ← 运行日志
 ```
 
-自动保留最近 **30 份**（约 7 个月），超出后自动删除最旧的。
+自动保留最近 **7 份**（约 1 周），超出后自动删除最旧的。如需更多历史版本，备份文件可直接拷贝到 iCloud / 网盘。
 
 ---
 
@@ -142,6 +142,6 @@ launchctl unload ~/Library/LaunchAgents/com.user.ielts-vocab-backup.plist
 
 ## 4. 维护清单
 
-- [ ] 每月初：检查 `~/Documents/ielts-vocab-backups/` 文件夹，确认有最新备份
+- [ ] 每月初：检查 `~/Documents/工作台备份/` 文件夹，确认有最新备份
 - [ ] 每季度：登录 GitHub → Actions → Keep Supabase Alive，查看最近 30 天运行历史
 - [ ] 每年：更新 keep-alive.yml 的 cron 表达式（如有 Supabase 政策变化）

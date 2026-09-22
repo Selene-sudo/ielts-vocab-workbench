@@ -2,6 +2,14 @@
 
 一个离线可用的雅思词汇学习工作台，覆盖刷词、听音辨义、拼写、错词复习、艾宾浩斯记忆曲线等。
 
+## 线上地址（当前生效）
+
+**https://ielts-vocab-workbench-97952.app.workbuddy.host/**
+
+> 旧地址 `https://29434aabec424d5f960282f5c0ffa5a2.app.workbuddy.link/` 已无法从本工作区更新，代码停留在旧版本，请勿再使用。
+
+云端数据托管在同一个 Supabase 项目（ref `fheznzjgwxyqtpdezwny`），页面内「云同步」登录后可在多设备同步单词本、错词本与学习进度。
+
 ## 技术栈
 - 原生 HTML / CSS / JavaScript，零外部依赖
 - 数据存浏览器 localStorage（不上传服务器）

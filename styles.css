@@ -998,6 +998,26 @@ body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
 }
+/* v6：顶部一键关闭 / 开启朗读音频 */
+.audio-toggle {
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.audio-toggle:hover {
+  border-color: var(--primary);
+}
+.audio-toggle.off {
+  background: transparent;
+  color: var(--muted);
+  border-style: dashed;
+}
 .cloud-btn {
   padding: 6px 12px;
   border-radius: 8px;
@@ -1086,4 +1106,23 @@ body {
 .login-msg { margin: 8px 0 0; min-height: 16px; }
 .login-msg.error { color: var(--danger); }
 .login-msg.success { color: #2cb67d; }
+
+/* ===== v5.9：错词复习 —— 拼写答题行 + 范围切换条 ===== */
+.spell-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+.spell-input-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.spell-input-row .btn { white-space: nowrap; }
+
+/* 错词复习卡片：拼写模式下让输入区与白板区更紧凑 */
+.spell-card .spell-input-row { margin-top: 10px; }
+
+/* 通用弹性占位（范围条右侧对齐用） */
+.grow { flex: 1 1 auto; }
 
