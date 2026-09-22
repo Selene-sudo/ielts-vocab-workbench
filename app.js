@@ -180,6 +180,8 @@
         if (typeof w.correctCount !== 'number') w.correctCount = 0;
         if (isPlaceholderMeaning(w.meaning)) w.meaning = '';
       }
+      // v6.1：补回历史错词缺失的中文释义（只填空，不覆盖）
+      try { healWrongMeanings(); } catch (e) { console.warn('healWrongMeanings on hydrate failed', e); }
       // 同步注入给 data.js 的 lookup
       window.VocabData.setUserDict(state.userDict);
 
@@ -1815,6 +1817,11 @@
     } else {
       state.wrongBook = incWrong.map(normalizeWrong);
     }
+    // v6.1：补齐云端历史错词缺失的中文释义
+    try {
+      const fixed = healWrongMeanings();
+      if (fixed > 0) toast(`🩹 已为 ${fixed} 条错词补回中文释义`);
+    } catch (e) { console.warn('healWrongMeanings failed', e); }
 
     // 4. 进度：仅在本地为空时才接受导入的进度（避免覆盖当前进行中的状态）
     // v5.9：同时接收「按单词本分片」的进度 map（已有的分片不被覆盖）
@@ -1864,6 +1871,44 @@
       })),
       progress: { mastered: new Set(b.progress?.mastered || []) }
     };
+  }
+
+  /* v6.1：错词释义自愈
+     云端存量 wrong_book 里有大量 meaning 为空的历史数据（表现为拼写/复习时不显示中文）。
+     每次载入或导入后，从「单词本 → 用户字典 → 内置词库」逐级回填，只填空、不覆盖已有释义。 */
+  function healWrongMeanings() {
+    const index = Object.create(null);
+    const put = (word, meaning) => {
+      if (!word || !meaning) return;
+      const k = String(word).toLowerCase();
+      if (!index[k]) index[k] = String(meaning).trim();
+    };
+    for (const b of (state.books || [])) {
+      for (const w of (b.words || [])) put(w.word, w.meaning);
+    }
+    try {
+      const dict = state.userDict || {};
+      for (const word of Object.keys(dict)) {
+        const e = dict[word] || {};
+        put(word, e.cn ? ((e.pos ? e.pos + ' ' : '') + e.cn) : null);
+      }
+    } catch (e) {}
+    try {
+      for (const w of (state.wrongBook || [])) put(w.word, w.meaning);
+    } catch (e) {}
+
+    let fixed = 0;
+    for (const w of (state.wrongBook || [])) {
+      if (w && !String(w.meaning || '').trim()) {
+        const m = index[String(w.word).toLowerCase()];
+        if (m) { w.meaning = m; fixed++; continue; }
+        try {
+          const e = window.VocabData && window.VocabData.lookup ? window.VocabData.lookup(w.word) : null;
+          if (e && e.cn) { w.meaning = ((e.pos ? e.pos + ' ' : '') + e.cn).trim(); fixed++; }
+        } catch (e) {}
+      }
+    }
+    return fixed;
   }
 
   function normalizeWrong(w) {
