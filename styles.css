@@ -242,6 +242,30 @@ body {
   transition: width 0.3s;
 }
 
+/* ===== v6.3：进度条 + 重置按钮（背诵 / 拼写 / 听音 三模式通用） ===== */
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.progress-row .progress-bar {
+  flex: 1 1 auto;
+  min-width: 80px;
+  margin-bottom: 0;
+}
+.progress-row .reset-inline {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 4px 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+@media (max-width: 640px) {
+  .progress-row { flex-wrap: wrap; }
+  .progress-row .progress-bar { flex-basis: 100%; }
+}
+
 /* ===== 单词本卡片 ===== */
 .grid {
   display: grid;
