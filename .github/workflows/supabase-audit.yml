@@ -136,12 +136,37 @@ jobs:
                   s = json.dumps(v, ensure_ascii=False)
                   p('STATE_SIZE', '%s\t%d chars' % (k, len(s)))
                   if k in ('last_study', 'last_spell', 'last_listen') and isinstance(v, dict):
-                      p('STATE_%s_TOPKEYS' % k, ','.join(list(v.keys())[:12]))
+                      m = v.get('__map') or {}
+                      p('STATE_%s_MAPKEYS' % k, ','.join(list(m.keys())[:30]) if isinstance(m, dict) else str(m)[:60])
+                      for mk, mv in list(m.items())[:30]:
+                          try:
+                              sub = (mv or {}).get('queue') or []
+                              p('STATE_MAPITEM', '%s\t%s\tidx=%s\tqueue=%d' % (
+                                  k.replace('last_', ''), mk, (mv or {}).get('index'), len(sub)))
+                          except Exception:
+                              pass
                   if k == 'prefs':
                       p('STATE_PREFS', s[:160])
               p('STATE_UPDATED_AT', r.get('updated_at', '?'))
           else:
               p('STATE', 'none or %s' % state)
+
+          # ---------- 6b. 缺释义的错词能否从单词本补回 ----------
+          st, all_words = rows_get('vocab_words',
+                                   'book_id=in.(%s)&select=book_id,word,meaning&limit=2000'
+                                   % ','.join([b['id'] for b in books]) if isinstance(books, list) else '')
+          meaning_by_word = {}
+          if isinstance(all_words, list):
+              for w in all_words:
+                  if w.get('word') and (w.get('meaning') or '').strip():
+                      meaning_by_word.setdefault(w['word'], w['meaning'])
+          p('WORDS_WITH_MEANING_INDEX', len(meaning_by_word))
+          if isinstance(wrong, list):
+              fixable = [w for w in wrong if not (w.get('meaning') or '').strip() and meaning_by_word.get(w.get('word'))]
+              still = [w for w in wrong if not (w.get('meaning') or '').strip() and not meaning_by_word.get(w.get('word'))]
+              p('WRONG_FIXABLE', len(fixable))
+              p('WRONG_UNFIXABLE', len(still))
+              p('WRONG_UNFIXABLE_SAMPLE', ','.join([w.get('word', '') for w in still[:15]]))
 
           # ---------- 7. 用户词典 ----------
           st, ud = rows_get('user_dict', 'user_id=eq.%s&select=word,entry&limit=5' % SUID)
