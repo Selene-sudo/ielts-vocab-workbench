@@ -31,12 +31,12 @@ jobs:
             -H "apikey: $SB_KEY" -H "Content-Type: application/json" \
             -d "{\"email\":\"$SB_EMAIL\",\"password\":\"$SB_PASS\"}")
           TOK=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('access_token',''))" 2>/dev/null)
-          UID=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('user',{}).get('id',''))" 2>/dev/null)
+          SUID=$(echo "$LOGIN" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('user',{}).get('id',''))" 2>/dev/null)
           if [ -z "$TOK" ]; then echo "@@LOGIN_FAILED"; echo "$LOGIN" | head -c 300; exit 1; fi
-          echo "@@USER_ID=$UID"
+          echo "@@USER_ID=$SUID"
 
           count_rows() {
-            # $1 = table, $2 = filter (e.g. "user_id=eq.$UID")
+            # $1 = table, $2 = filter (e.g. "user_id=eq.$SUID")
             local h
             h=$(curl -sS -I "$SB_URL/rest/v1/$1?$2&select=id" \
                   -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" \
@@ -45,13 +45,13 @@ jobs:
           }
 
           echo "=== 2. 该用户各表行数 ==="
-          printf "@@COUNT books=%s\n"      "$(count_rows vocab_books  "user_id=eq.$UID")"
-          printf "@@COUNT wrong_book=%s\n" "$(count_rows wrong_book   "user_id=eq.$UID")"
-          printf "@@COUNT user_dict=%s\n"  "$(count_rows user_dict    "user_id=eq.$UID")"
-          printf "@@COUNT user_state=%s\n" "$(count_rows user_state   "user_id=eq.$UID")"
+          printf "@@COUNT books=%s\n"      "$(count_rows vocab_books  "user_id=eq.$SUID")"
+          printf "@@COUNT wrong_book=%s\n" "$(count_rows wrong_book   "user_id=eq.$SUID")"
+          printf "@@COUNT user_dict=%s\n"  "$(count_rows user_dict    "user_id=eq.$SUID")"
+          printf "@@COUNT user_state=%s\n" "$(count_rows user_state   "user_id=eq.$SUID")"
 
           echo "=== 3. 单词本明细与每本书的单词数 ==="
-          BOOKS=$(curl -sS "$SB_URL/rest/v1/vocab_books?user_id=eq.$UID&select=id,name,created_at" \
+          BOOKS=$(curl -sS "$SB_URL/rest/v1/vocab_books?user_id=eq.$SUID&select=id,name,created_at" \
                   -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK")
           echo "$BOOKS" | python3 -c "
           import json,sys
@@ -62,7 +62,7 @@ jobs:
           for b in bs: print('@@BOOK\t%s\t%s\t%s' % (b.get('name',''), b.get('id',''), b.get('created_at','')[:10]))
           " || true
 
-          if [ -z "$UID" ]; then exit 1; fi
+          if [ -z "$SUID" ]; then exit 1; fi
           for BID in $(echo "$BOOKS" | python3 -c "
           import json,sys
           try:
@@ -93,11 +93,11 @@ jobs:
           fi
 
           echo "=== 5. 最近 5 条错词（确认数据内容） ==="
-          curl -sS "$SB_URL/rest/v1/wrong_book?user_id=eq.$UID&select=word,meaning,correct_count,updated_at&order=updated_at.desc&limit=5" \
+          curl -sS "$SB_URL/rest/v1/wrong_book?user_id=eq.$SUID&select=word,meaning,correct_count,updated_at&order=updated_at.desc&limit=5" \
             -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | head -c 700
 
           echo "=== 6. user_state 关键字段 ==="
-          curl -sS "$SB_URL/rest/v1/user_state?user_id=eq.$UID" \
+          curl -sS "$SB_URL/rest/v1/user_state?user_id=eq.$SUID" \
             -H "apikey: $SB_KEY" -H "Authorization: Bearer $TOK" | python3 -c "
           import json,sys
           try:
