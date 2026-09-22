@@ -23,6 +23,13 @@
 
   function fmtDate(d) { try { return d ? new Date(d).toISOString() : null; } catch (e) { null; } }
 
+  // v5.9：把「按单词本分片的进度 map」随快照一起打包上传
+  function packProgress(base, map) {
+    const hasMap = map && Object.keys(map).length > 0;
+    if (!base && !hasMap) return null;
+    return Object.assign({}, base || {}, { __map: map || {} });
+  }
+
   // ====== 单本书同步（独立函数，便于并发） ======
   async function syncBook(book, userId) {
     let bid = book.id;
@@ -133,9 +140,9 @@
       await window.SB.upsert('user_state', {
         user_id: userId,
         prefs: s.prefs || {},
-        last_study: s.lastStudy || null,
-        last_spell: s.lastSpell || null,
-        last_listen: s.lastListen || null
+        last_study: packProgress(s.lastStudy, s.lastStudyMap),
+        last_spell: packProgress(s.lastSpell, s.lastSpellMap),
+        last_listen: packProgress(s.lastListen, s.lastListenMap)
       }, 'user_id');
 
       const elapsed = Date.now() - startTs;

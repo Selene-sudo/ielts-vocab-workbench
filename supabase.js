@@ -17,29 +17,92 @@
   }
   function accessToken() { return (session && session.access_token) || SUPABASE_ANON_KEY; }
 
-  // ====== 底层 fetch 封装 ======
-  async function rest(method, path, body, options) {
-    options = options || {};
+  // ====== 通用请求错误封装 ======
+  function makeError(resp, data) {
+    const err = new Error((data && (data.message || data.error_description || data.msg)) || ('HTTP ' + resp.status));
+    err.status = resp.status;
+    err.data = data;
+    return err;
+  }
+
+  // 认证端点专用：Authorization 必须始终是 anon key（不能带已过期的 access_token）
+  async function authRest(method, path, body) {
     const url = SUPABASE_URL + path;
     const headers = {
       'apikey': SUPABASE_ANON_KEY,
-      'Authorization': 'Bearer ' + accessToken(),
+      'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
       'Content-Type': 'application/json'
     };
-    if (options.prefer) headers['Prefer'] = options.prefer;
     const opts = { method, headers };
     if (body !== undefined && body !== null) opts.body = JSON.stringify(body);
     const resp = await fetch(url, opts);
     const text = await resp.text();
     let data;
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
-    if (!resp.ok) {
-      const err = new Error((data && (data.message || data.error_description || data.msg)) || ('HTTP ' + resp.status));
-      err.status = resp.status;
-      err.data = data;
+    if (!resp.ok) throw makeError(resp, data);
+    return data;
+  }
+
+  // ====== 底层 fetch 封装（含 access_token 过期自动刷新） ======
+  async function rest(method, path, body, options) {
+    options = options || {};
+    const url = SUPABASE_URL + path;
+
+    function buildHeaders() {
+      const headers = {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': 'Bearer ' + accessToken(),
+        'Content-Type': 'application/json'
+      };
+      if (options.prefer) headers['Prefer'] = options.prefer;
+      return headers;
+    }
+
+    async function send() {
+      const headers = buildHeaders();
+      const opts = { method, headers };
+      if (body !== undefined && body !== null) opts.body = JSON.stringify(body);
+      const resp = await fetch(url, opts);
+      const text = await resp.text();
+      let data;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+      if (!resp.ok) throw makeError(resp, data);
+      return data;
+    }
+
+    function isExpired(err) {
+      if (!err) return false;
+      if (err.status === 401) return true;
+      const msg = (err.message || '').toLowerCase();
+      return msg.indexOf('jwt expired') !== -1 ||
+             msg.indexOf('token expired') !== -1 ||
+             msg.indexOf('token is expired') !== -1 ||
+             msg.indexOf('invalid claim: token expired') !== -1 ||
+             msg.indexOf('unauthorized') !== -1;
+    }
+
+    try {
+      return await send();
+    } catch (err) {
+      if (isExpired(err)) {
+        if (session && session.refresh_token) {
+          try {
+            await SB.refresh();
+            return await send();
+          } catch (refreshErr) {
+            saveSession(null);
+            const finalErr = new Error('登录已过期，请重新登录：' + (refreshErr.message || refreshErr));
+            finalErr.status = 401;
+            finalErr.data = refreshErr.data;
+            throw finalErr;
+          }
+        } else {
+          saveSession(null);
+          throw new Error('登录已过期，请重新登录');
+        }
+      }
       throw err;
     }
-    return data;
   }
 
   const SB = {
@@ -50,7 +113,7 @@
     getSession: function () { return session; },
 
     signUp: async function (email, password) {
-      const data = await rest('POST', '/auth/v1/signup', { email, password });
+      const data = await authRest('POST', '/auth/v1/signup', { email, password });
       if (data && data.access_token) {
         saveSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
       }
@@ -58,19 +121,19 @@
     },
 
     signIn: async function (email, password) {
-      const data = await rest('POST', '/auth/v1/token?grant_type=password', { email, password });
+      const data = await authRest('POST', '/auth/v1/token?grant_type=password', { email, password });
       saveSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
       return data;
     },
 
     signOut: async function () {
-      try { if (session && session.access_token) await rest('POST', '/auth/v1/logout', {}); } catch (e) {}
+      try { if (session && session.access_token) await authRest('POST', '/auth/v1/logout', {}); } catch (e) {}
       saveSession(null);
     },
 
     refresh: async function () {
       if (!session || !session.refresh_token) throw new Error('no refresh token');
-      const data = await rest('POST', '/auth/v1/token?grant_type=refresh_token', { refresh_token: session.refresh_token });
+      const data = await authRest('POST', '/auth/v1/token?grant_type=refresh_token', { refresh_token: session.refresh_token });
       saveSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
       return session;
     },

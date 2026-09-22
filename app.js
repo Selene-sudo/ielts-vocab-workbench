@@ -15,8 +15,10 @@
     activeBookId: null,
     activeWrongSession: false,
     studyIndex: 0,
-    studyQueue: [],     // 当前背诵队列
+    studyQueue: [],     // 当前背诵队列（v6：可能含重复项 —— 未通过的词会重新排入队尾）
     studyRevealed: false,
+    studyStreak: {},    // v6：{ word: 连续「认识」次数 }，达到 STUDY_PASS_STREAK 才通过
+    audioMuted: false,  // v6：全局朗读总开关（顶部 🔊 按钮）
     dictFilter: 'all',  // all | word | phrase
     editScope: 'dict',
     // 拼写平台状态
@@ -28,6 +30,16 @@
     // —— v5：进度恢复 ——
     lastStudy: null,    // { activeBookId, activeWrongSession, studyIndex, studyQueue, studyRevealed }
     lastSpell: null,    // { scope, queue, index, answered }
+    // —— v5.9：按单词本 / 范围分片保存的进度（key = bookId | 'wrong' | scope）——
+    lastStudyMap: {},   // { [bookId|'wrong']: { index, revealed, queue: [{word}] } }
+    lastSpellMap: {},   // { [scope]: { index, answered, queue: [{word,key,sourceBookId,lastOk,userInput}] } }
+    lastListenMap: {},  // { [scope]: { index, answered, queue: [{word,key,sourceBookId}] } }
+    wrongSessionScope: 'all', // 错词复习会话限定的范围：all | book:<id> | orphans
+    wrongCardMode: 'recall',  // 错词复习卡片模式：recall（认不认识）| spell（拼写）
+    wrongSpellAnswered: false,
+    wrongSpellOk: false,
+    wrongSpellInput: '',
+    _wrongQueueScope: null,   // 当前错词队列对应的范围（内存态，不持久化）
     // —— 听音辨义（独立模块） ——
     listenScope: 'book',  // book:<id> | wrong | all
     listenQueue: [],      // [{ word, key, sourceBookId, srs, type, meaning, entry }]
@@ -46,6 +58,12 @@
   // 经典间隔：1 → 2 → 4 → 7 → 15 → 30（天），之后保持 30
   const SRS_INTERVALS = [1, 2, 4, 7, 15, 30];
   const DAY_MS = 24 * 60 * 60 * 1000;
+
+  /* ---------- 0.6 v6：背诵词卡通过规则 ---------- */
+  // 每个词需要「连续认识」STUDY_PASS_STREAK 次才算通过；
+  // 期间任何一次「不认识」都会把计数清零、立即进错词本，并把词卡重新排回队尾
+  // —— 也就是点一次不认识后，这张卡至少还要再出现两次、连续答对两次才能过。
+  const STUDY_PASS_STREAK = 2;
 
   /** 创建一个新的 SRS 记录（初次学习） */
   function newSrsRecord() {
@@ -85,6 +103,25 @@
     return srs ? JSON.parse(JSON.stringify(srs)) : newSrsRecord();
   }
 
+  /* ---------- 0.2 分片进度（v5.9）：把 progress map 与"最近一次"快照打包/拆包 ---------- */
+  /** 打包：{ ...base, __map: map }；两者都空则返回 null */
+  function attachMap(base, map) {
+    const hasMap = map && Object.keys(map).length > 0;
+    if (!base && !hasMap) return null;
+    return { ...(base || {}), __map: map || {} };
+  }
+  /** 拆包：取出分片 map */
+  function readMap(raw) {
+    if (!raw || typeof raw !== 'object') return {};
+    return raw.__map || {};
+  }
+  /** 拆包：取出不含 __map 的"最近一次"快照 */
+  function stripMap(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const { __map, ...rest } = raw;
+    return Object.keys(rest).length ? rest : null;
+  }
+
   function persist() {
     const slim = {
       books: state.books.map(b => ({
@@ -96,15 +133,21 @@
       })),
       wrongBook: state.wrongBook,
       userDict: state.userDict,
-      // v5：保存进度
-      lastStudy: state.lastStudy,
-      lastSpell: state.lastSpell,
-      lastListen: state.lastListen,
-      // v5：保存用户偏好
+      // v5：保存进度（v5.9：随快照一起带上按单词本分片的 map）
+      lastStudy: attachMap(state.lastStudy, state.lastStudyMap),
+      lastSpell: attachMap(state.lastSpell, state.lastSpellMap),
+      lastListen: attachMap(state.lastListen, state.lastListenMap),
+      // v5：保存用户偏好（v5.9：并记住上次所在的范围，刷新后可直接续上进度）
       prefs: {
         autoSpeak: state.autoSpeak,
+        audioMuted: !!state.audioMuted,
         wrongFilter: state.wrongFilter,
-        reviewFilter: state.reviewFilter
+        reviewFilter: state.reviewFilter,
+        activeBookId: state.activeBookId,
+        spellScope: state.spellScope,
+        listenScope: state.listenScope,
+        wrongSessionScope: state.wrongSessionScope,
+        wrongCardMode: state.wrongCardMode
       }
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
@@ -135,20 +178,31 @@
         if (!w.type) w.type = window.VocabData.detectType(w.word);
         if (!w.srs) w.srs = newSrsRecord();
         if (typeof w.correctCount !== 'number') w.correctCount = 0;
+        if (isPlaceholderMeaning(w.meaning)) w.meaning = '';
       }
       // 同步注入给 data.js 的 lookup
       window.VocabData.setUserDict(state.userDict);
 
-      // v5：恢复用户偏好
+      // v5：恢复用户偏好（v5.9：含上次所在范围）
       if (data.prefs) {
         state.autoSpeak = data.prefs.autoSpeak !== false;
+        state.audioMuted = !!data.prefs.audioMuted;
         state.wrongFilter = data.prefs.wrongFilter || 'all';
         state.reviewFilter = data.prefs.reviewFilter || 'all';
+        if (data.prefs.activeBookId) state.activeBookId = data.prefs.activeBookId;
+        if (data.prefs.spellScope) state.spellScope = data.prefs.spellScope;
+        if (data.prefs.listenScope) state.listenScope = data.prefs.listenScope;
+        if (data.prefs.wrongSessionScope) state.wrongSessionScope = data.prefs.wrongSessionScope;
+        if (data.prefs.wrongCardMode) state.wrongCardMode = data.prefs.wrongCardMode;
       }
       // v5：恢复进度（先放在 lastStudy / lastSpell，下次切到对应 tab 时 apply）
-      state.lastStudy = data.lastStudy || null;
-      state.lastSpell = data.lastSpell || null;
-      state.lastListen = data.lastListen || null;
+      // v5.9：同时恢复"按单词本 / 范围分片"的进度 map
+      state.lastStudy = stripMap(data.lastStudy);
+      state.lastSpell = stripMap(data.lastSpell);
+      state.lastListen = stripMap(data.lastListen);
+      state.lastStudyMap = readMap(data.lastStudy);
+      state.lastSpellMap = readMap(data.lastSpell);
+      state.lastListenMap = readMap(data.lastListen);
     } catch (e) {
       console.warn('恢复本地数据失败', e);
     }
@@ -195,11 +249,17 @@
     voices: [],
     ready: false,
     preferredVoice: null,
+    supported: true,
+    muted: false,          // v6：全局静音（由顶部 🔊 按钮控制）
     _loadPromise: null,
     _loading: false,
     _lastSpokenText: '',
     _lastSpeakAt: 0,
     _speaking: false,
+    _cardKey: null,        // v6：当前词卡对应的文本，用于"换词即停/出现即播"
+    _watchdog: null,       // v6：Chrome 长句会被"卡住"，定时 resume
+    _unlocked: false,      // v6：iOS/Safari 需要一次用户手势解锁
+    _retryTimers: [],
     init() {
       if (!('speechSynthesis' in window)) {
         this.supported = false;
@@ -243,6 +303,31 @@
         if (this.ready || tries++ > 30) { clearInterval(poll); return; }
         loadVoices();
       }, 250);
+
+      // v6：一次用户手势解锁 —— iOS/Safari 首次必须由手势触发，否则后续 speak 静默失败
+      const unlock = () => {
+        if (this._unlocked) return;
+        this._unlocked = true;
+        try {
+          const u = new SpeechSynthesisUtterance(' ');
+          u.volume = 0;
+          u.lang = 'en-GB';
+          speechSynthesis.speak(u);
+        } catch (e) {}
+        document.removeEventListener('pointerdown', unlock, true);
+        document.removeEventListener('touchstart', unlock, true);
+        document.removeEventListener('keydown', unlock, true);
+      };
+      document.addEventListener('pointerdown', unlock, true);
+      document.addEventListener('touchstart', unlock, true);
+      document.addEventListener('keydown', unlock, true);
+
+      // v6：页面回到前台 / 从暂停态恢复 —— 修复"放着放着就没声了"
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && !this.muted) {
+          try { speechSynthesis.resume(); } catch (e) {}
+        }
+      });
     },
     /** 等待 voice 加载完成（最多等待 ~3s），返回是否 ready */
     whenReady(timeoutMs = 3000) {
@@ -259,9 +344,38 @@
       });
       return this._loadPromise;
     },
+    /** v6：停掉当前朗读（词卡消失 / 静音 / 切页时调用） */
+    stop() {
+      try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) {}
+      this._speaking = false;
+      this._clearTimers();
+      this._stopWatchdog();
+    },
+    setMuted(flag) {
+      this.muted = !!flag;
+      if (this.muted) this.stop();
+    },
+    _clearTimers() {
+      (this._retryTimers || []).forEach(t => clearTimeout(t));
+      this._retryTimers = [];
+    },
+    /** Chrome 会把长句/连续 speak 卡在 paused 状态，定时 resume 兜底 */
+    _startWatchdog() {
+      this._stopWatchdog();
+      this._watchdog = setInterval(() => {
+        if (this.muted) { this._stopWatchdog(); return; }
+        try {
+          if (speechSynthesis.speaking && speechSynthesis.paused) speechSynthesis.resume();
+        } catch (e) {}
+      }, 4000);
+    },
+    _stopWatchdog() {
+      if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
+    },
     speak(text) {
       const t = String(text || '').trim();
       if (!t) return;
+      if (this.muted) return;
       if (!this.supported) {
         toast('当前浏览器不支持语音合成，建议使用 Chrome / Edge / Safari');
         return;
@@ -273,56 +387,66 @@
       this._lastSpokenText = t;
       this._lastSpeakAt = now;
 
-      const trySpeak = () => {
+      const buildUtterance = () => {
+        const u = new SpeechSynthesisUtterance(t);
+        u.lang = 'en-GB';
+        u.rate = 0.92;
+        u.pitch = 1;
+        u.volume = 1;
+        // 即便 voice.lang 不是 en-GB，也保留 lang 字段，让浏览器走英国口音模型
+        if (this.preferredVoice) u.voice = this.preferredVoice;
+        return u;
+      };
+
+      const trySpeak = (attempt) => {
+        if (this.muted) return;
         try {
+          // v6：先 resume —— Chrome 在暂停态下 speak 会被直接丢弃（"经常不出音"的主因之一）
+          try { speechSynthesis.resume(); } catch (e) {}
           // 仅在 idle 时 cancel，避免打断当前播放
           if (!speechSynthesis.speaking && !speechSynthesis.pending) {
             speechSynthesis.cancel();
           }
-          const u = new SpeechSynthesisUtterance(t);
-          u.lang = 'en-GB';
-          u.rate = 0.92;
-          u.pitch = 1;
-          // 即便 voice.lang 不是 en-GB，也保留 lang 字段，让浏览器走英国口音模型
-          if (this.preferredVoice) u.voice = this.preferredVoice;
+          const u = buildUtterance();
           let started = false;
-          u.onstart = () => { started = true; this._speaking = true; };
-          u.onend = () => { this._speaking = false; clearTimeout(retryT); };
+          u.onstart = () => { started = true; this._speaking = true; this._startWatchdog(); };
+          u.onend = () => { this._speaking = false; this._stopWatchdog(); };
           u.onerror = (ev) => {
             this._speaking = false;
-            clearTimeout(retryT);
+            this._stopWatchdog();
             // 'canceled' / 'interrupted' 不算错误
             if (ev && (ev.error === 'canceled' || ev.error === 'interrupted')) return;
             console.warn('[speech] error', ev);
+            // v6：真错误（如 synthesis-failed / audio-busy）→ 换一条 utterance 再试
+            if ((attempt || 0) < 2) {
+              const t2 = setTimeout(() => trySpeak((attempt || 0) + 1), 180);
+              this._retryTimers.push(t2);
+            }
           };
           speechSynthesis.speak(u);
-          // 兜底：600ms 后还没开始播，说明这次 speak 被浏览器吞了（user activation 失效 / 静音 / 后台等），再 speak 一次
+          // 兜底：500ms 后还没开始播，说明这次 speak 被浏览器吞了（user activation 失效 / 静音 / 后台等），再 speak 一次
           const retryT = setTimeout(() => {
-            if (!started && !speechSynthesis.speaking) {
-              try {
-                speechSynthesis.cancel();
-                const u2 = new SpeechSynthesisUtterance(t);
-                u2.lang = 'en-GB';
-                u2.rate = 0.92;
-                u2.pitch = 1;
-                if (this.preferredVoice) u2.voice = this.preferredVoice;
-                speechSynthesis.speak(u2);
-              } catch (e) {}
+            if (this.muted) return;
+            if (!started && !speechSynthesis.speaking && (attempt || 0) < 2) {
+              console.warn('[speech] 未开始播放，重试第', (attempt || 0) + 1, '次');
+              trySpeak((attempt || 0) + 1);
             }
-          }, 600);
+          }, 500);
+          this._retryTimers.push(retryT);
         } catch (e) {
-          toast('发音失败：' + e.message);
+          console.warn('[speech] 发音异常', e);
         }
       };
 
       // 如果 voice 还没好，先等 ready 再播；超时则仍尝试一次（浏览器会用 lang 自动选）
       if (!this.ready) {
         this.whenReady(2500).then(ok => {
-          trySpeak();
+          if (this.muted) return;
+          trySpeak(0);
           if (!ok) console.warn('[speech] voices 未加载，仍尝试用 lang=en-GB 播放');
         });
       } else {
-        trySpeak();
+        trySpeak(0);
       }
     },
     /** 渲染一个 🔊 按钮；点击触发 speak。clicks 委托给顶层（避免被外部捕获） */
@@ -333,10 +457,45 @@
   };
   Speech.init();
 
+  /**
+   * v6：把音频和「词卡生命周期」绑在一起
+   *  - 卡片换词（上一张消失 / 这一张出现）→ 停掉上一张的音频
+   *  - 新卡片出现 → 自动朗读（autoSpeak 开启且未静音时）
+   *  - silent = true 时不自动发声，但仍然负责"换词即停"
+   */
+  function syncCardAudio(word, opts) {
+    const o = opts || {};
+    const key = String(word || '').trim();
+    if (Speech._cardKey !== key) {
+      Speech.stop();
+      Speech._cardKey = key || null;
+    }
+    if (!key || o.silent) return;
+    if (!state.autoSpeak || state.audioMuted) return;
+    try { Speech.speak(key); } catch (e) {}
+  }
+
+  /** v6：卡片区域没词了（空态 / 本轮完成）→ 立刻停声 */
+  function endCardAudio() {
+    Speech.stop();
+    Speech._cardKey = null;
+  }
+
+  /** v6：用户主动点 🔊 播放（静音时给个提示，避免"点了没反应"的错觉） */
+  function manualSpeak(text) {
+    if (state.audioMuted) {
+      toast('🔇 朗读已关闭 · 点顶部 🔊 可重新开启');
+      return;
+    }
+    try { Speech.speak(text); } catch (e) {}
+  }
+
   /* ---------- 2. Tab 切换 ---------- */
   function bindTabs() {
     $all('.tab').forEach(tab => {
       tab.addEventListener('click', () => {
+        // v6：离开当前页面 → 立刻停掉正在朗读的音频（音频跟随单词消失而消失）
+        endCardAudio();
         $all('.tab').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         const target = tab.dataset.tab;
@@ -474,22 +633,33 @@
     }
 
     // 标准单词本背诵
-    state.studyQueue = buildStudyQueue(book);
-    // 如果有 lastStudy 且是同一本词本 → 尝试把 studyIndex 对应到当前队列里同一词
-    if (state.lastStudy && state.lastStudy.activeBookId === book.id && !state.lastStudy.activeWrongSession && Array.isArray(state.lastStudy.studyQueue)) {
-      const prevQueue = state.lastStudy.studyQueue;
-      const sameWord = prevQueue[state.lastStudy.studyIndex];
-      if (sameWord) {
-        const idx = state.studyQueue.findIndex(w => w.word === sameWord.word);
-        if (idx >= 0) {
-          state.studyIndex = idx;
-          state.studyRevealed = !!state.lastStudy.studyRevealed;
-          // 已掌握变化：如果之前未掌握现在被识别为已掌握，studyQueue 会少一条，但 index 不偏移
-        }
+    const freshQueue = buildStudyQueue(book);
+    // v5.9 / v6：每个单词本各自保存进度 —— 优先从本本的快照恢复
+    // v6 起队列里可能含重复项（未通过的词会重新排队），所以按「保存的顺序」原样重建
+    const savedStudy = getStudyProgress(book.id);
+    let restored = false;
+    if (savedStudy && Array.isArray(savedStudy.queue) && savedStudy.queue.length) {
+      const byWord = new Map(book.words.map(w => [w.word, w]));
+      const rebuilt = savedStudy.queue
+        .map(q => byWord.get(q && q.word ? q.word : q))
+        .filter(w => w && !book.progress.mastered.has(w.word));
+      if (rebuilt.length) {
+        // 快照之后新导入的词补到队尾，避免漏背
+        const inQueue = new Set(rebuilt.map(w => w.word));
+        for (const w of freshQueue) if (!inQueue.has(w.word)) rebuilt.push(w);
+        state.studyQueue = rebuilt;
+        const savedIdx = savedStudy.index || 0;
+        state.studyIndex = savedIdx >= rebuilt.length ? rebuilt.length : savedIdx;
+        state.studyRevealed = !!savedStudy.revealed;
+        state.studyStreak = { ...(savedStudy.streak || {}) };
+        restored = true;
       }
-    } else {
+    }
+    if (!restored) {
+      state.studyQueue = freshQueue;
       state.studyIndex = 0;
       state.studyRevealed = false;
+      state.studyStreak = {};
     }
     saveLastStudy();
 
@@ -501,16 +671,53 @@
     renderStudyCard();
   }
 
-  /** 把当前背诵状态写到 state.lastStudy 并 persist */
+  /** 取某个 key（单词本 id / 'wrong'）的背诵进度快照 */
+  function getStudyProgress(key) {
+    if (!key) return null;
+    const m = state.lastStudyMap && state.lastStudyMap[key];
+    if (m && Array.isArray(m.queue) && m.queue.length) return m;
+    // 兼容旧数据：只有单份 lastStudy 时，若指向本本则沿用
+    if (state.lastStudy && state.lastStudy.activeBookId === key && !state.lastStudy.activeWrongSession) {
+      return {
+        index: state.lastStudy.studyIndex,
+        revealed: state.lastStudy.studyRevealed,
+        queue: state.lastStudy.studyQueue
+      };
+    }
+    return null;
+  }
+
+  /** 把当前背诵状态写到 state.lastStudy（最近一次）+ lastStudyMap（按单词本/范围分片）并 persist */
   function saveLastStudy() {
+    const queue = state.studyQueue.map(w => ({ word: w.word }));
+    // v5.9：错词会话按「范围」独立分片，普通背诵按「单词本」分片
+    const key = state.activeWrongSession
+      ? wrongStudyKey(state.wrongSessionScope || 'all')
+      : state.activeBookId;
     state.lastStudy = {
       activeBookId: state.activeBookId,
       activeWrongSession: !!state.activeWrongSession,
       studyIndex: state.studyIndex,
-      studyQueue: state.studyQueue.map(w => ({ word: w.word })),
+      studyQueue: queue,
       studyRevealed: !!state.studyRevealed
     };
+    // v5.9：按 key 分片保存 —— 切到别的词本/范围再切回来，进度仍在
+    if (key) {
+      state.lastStudyMap[key] = {
+        index: state.studyIndex,
+        revealed: !!state.studyRevealed,
+        queue,
+        // v6：把「连续认识」计数一起存下来，切走再回来不会白答
+        streak: { ...(state.studyStreak || {}) },
+        wrongFilter: state.activeWrongSession ? (state.wrongSessionScope || 'all') : null
+      };
+    }
     persist();
+  }
+
+  /** 错词复习进度的分片 key */
+  function wrongStudyKey(scope) {
+    return 'wrong|' + (scope || 'all');
   }
 
   function renderStudyCard() {
@@ -522,7 +729,15 @@
 
     const area = $('#studyArea');
 
+    // v6：队列里可能残留已经通过的重复项 → 先跳过，避免"过了又出现"
+    while (state.studyIndex < state.studyQueue.length) {
+      const cur = state.studyQueue[state.studyIndex];
+      if (cur && book.progress.mastered.has(cur.word)) { state.studyIndex++; continue; }
+      break;
+    }
+
     if (remain === 0) {
+      endCardAudio();
       area.innerHTML = `
         <div class="study-empty">
           <div class="icon">🎉</div>
@@ -534,19 +749,17 @@
           </div>
         </div>`;
       $('#startSpellOfBook')?.addEventListener('click', () => startSpellScope('book:' + book.id));
-      $('#goWrong').addEventListener('click', () => {
-        state.activeWrongSession = true;
-        renderStudy();
-      });
+      $('#goWrong').addEventListener('click', () => startWrongSession('book:' + book.id));
       return;
     }
 
     if (state.studyIndex >= state.studyQueue.length) {
+      endCardAudio();
       area.innerHTML = `
         <div class="study-empty">
           <div class="icon">✅</div>
           <h3>本轮完成！</h3>
-          <p>本轮所有词已过一遍。<b>认识</b>的词不再出现；<b>不认识</b>的已加入错词本（需 3 次认识才能毕业）。</p>
+          <p>每个词都<b>连续认识 ${STUDY_PASS_STREAK} 次</b>才算过，已通过的不再出现；<b>不认识</b>的已加入错词本（需累计答对 3 次才能毕业）。</p>
           <div style="margin-top:18px" class="row gap">
             <button class="btn" id="restartRound">再走一遍（错词优先）</button>
             <button class="btn primary" id="goWrong2">复习错词本</button>
@@ -556,12 +769,10 @@
       $('#restartRound').addEventListener('click', () => {
         state.studyIndex = 0;
         state.studyRevealed = false;
+        state.studyStreak = {};
         renderStudyCard();
       });
-      $('#goWrong2').addEventListener('click', () => {
-        state.activeWrongSession = true;
-        renderStudy();
-      });
+      $('#goWrong2').addEventListener('click', () => startWrongSession('book:' + book.id));
       $('#spellThisBook')?.addEventListener('click', () => startSpellScope('book:' + book.id));
       return;
     }
@@ -570,6 +781,8 @@
     const entry = window.VocabData.lookup(w.word);
     const pct = ((state.studyIndex) / state.studyQueue.length) * 100;
     const typeTag = renderTypeTag(w.type);
+    const streak = state.studyStreak[w.word] || 0;
+    const needMore = Math.max(0, STUDY_PASS_STREAK - streak);
 
     area.innerHTML = `
       <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
@@ -577,7 +790,7 @@
         <div class="card-actions" title="点击可重新朗读">
           ${Speech.button(w.word, { small: true })}
         </div>
-        <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · ${typeTag}</div>
+        <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · ${typeTag}${streak ? ` · 已连续认识 ${streak}/${STUDY_PASS_STREAK}` : ''}</div>
         <div class="word ${w.type === 'sentence' ? 'sentence' : (w.type === 'phrase' ? 'phrase' : '')}">${escapeHtml(w.word)}</div>
         ${entry.phonetic ? `<div class="phonetic">${escapeHtml(entry.phonetic)}</div>` : `<div class="phonetic muted">（暂无音标）</div>`}
         ${state.studyRevealed
@@ -595,20 +808,18 @@
           </button>
           <div class="actions-main">
             <button class="btn unknow" id="btnUnknow">不认识 → 入错词本</button>
-            <button class="btn know" id="btnKnow">认识 ✓</button>
+            <button class="btn know" id="btnKnow">认识 ✓${streak ? `（再需 ${needMore} 次）` : `（需连续 ${STUDY_PASS_STREAK} 次）`}</button>
           </div>
         </div>
       ` : ''}
     `;
 
-    // 词卡一出现就自动发音（英式）。可在偏好里关闭：Ctrl/Cmd+Shift+S
+    // v6：音频跟随词卡 —— 换词就停掉上一张卡的音频，新卡出现就自动朗读
     // 不放 setTimeout：保持用户点击栈内的 user activation（Chrome 才有声音）
-    if (state.autoSpeak) {
-      try { Speech.speak(w.word); } catch (e) {}
-      if (!sessionStorage.getItem('__autospk_hinted')) {
-        sessionStorage.setItem('__autospk_hinted', '1');
-        toast('🔊 已开启自动英式朗读 · 点 🔊 可单独再读 · Ctrl/Cmd+Shift+S 关闭');
-      }
+    syncCardAudio(w.word);
+    if (state.autoSpeak && !state.audioMuted && !sessionStorage.getItem('__autospk_hinted')) {
+      sessionStorage.setItem('__autospk_hinted', '1');
+      toast('🔊 已开启自动英式朗读 · 点 🔊 可单独再读 · 顶部 🔊 可一键静音');
     }
 
     // 绑定词卡上的"编辑"按钮（不管是否揭示都能点）
@@ -654,33 +865,50 @@
 
   function handleAnswer(know, word) {
     const book = state.books.find(b => b.id === state.activeBookId);
+    if (!state.studyStreak) state.studyStreak = {};
+
     if (know) {
-      // 认识 → 加入本本 mastered 集合（认识的不再出现）
-      book.progress.mastered.add(word.word);
       // 更新 SRS：按照认识次数推进到下一个艾宾浩斯阶梯
       const srs = ensureSrs(word);
       srs.lastReviewed = Date.now();
       nextReviewAfter(srs, true);
-      // 同时如果在错词本里，则累计 1 次
-      const wrong = state.wrongBook.find(w => w.word === word.word);
-      if (wrong) {
-        wrong.correctCount = (wrong.correctCount || 0) + 1;
-        wrong.lastSeen = Date.now();
-        ensureSrs(wrong);
-        if (wrong.correctCount >= 3) {
-          state.wrongBook = state.wrongBook.filter(w => w.word !== word.word);
-          toast(`「${word.word}」已从错词本毕业！`);
+
+      const streak = (state.studyStreak[word.word] || 0) + 1;
+      state.studyStreak[word.word] = streak;
+
+      if (streak >= STUDY_PASS_STREAK) {
+        // 连续认识达标 → 通过，不再出现
+        delete state.studyStreak[word.word];
+        book.progress.mastered.add(word.word);
+        const wrong = state.wrongBook.find(w => w.word === word.word);
+        if (wrong) {
+          wrong.correctCount = (wrong.correctCount || 0) + 1;
+          wrong.lastSeen = Date.now();
+          ensureSrs(wrong);
+          if (wrong.correctCount >= 3) {
+            state.wrongBook = state.wrongBook.filter(w => w.word !== word.word);
+            toast(`「${word.word}」连续认识 ${STUDY_PASS_STREAK} 次 ✓ 并从错词本毕业！`);
+          } else {
+            toast(`「${word.word}」连续认识 ${STUDY_PASS_STREAK} 次 ✓ · 错词本累计 ${wrong.correctCount}/3`);
+          }
         } else {
-          toast(`「${word.word}」已答对 ${wrong.correctCount}/3`);
+          toast(`「${word.word}」连续认识 ${STUDY_PASS_STREAK} 次，通过 ✓`);
         }
+      } else {
+        // 还没连续达标 → 这张卡重新排回队尾，稍后再考
+        state.studyQueue.push(word);
+        const wrong = state.wrongBook.find(w => w.word === word.word);
+        toast(`「${word.word}」已认识 ${streak}/${STUDY_PASS_STREAK} · 稍后会再考一次${wrong ? `（错词本 ${wrong.correctCount || 0}/3）` : ''}`);
       }
     } else {
-      // 不认识 → 加入错词本（哪怕之前已经存在，把 lastSeen / sources 更新）
-      addToWrongBook(word.word, word.type, book.id);
-      // SRS 重置回第一阶梯
+      // 不认识 → 计数清零、立即进错词本，并把词卡重新排回队尾
+      // （至少要再连续答对 STUDY_PASS_STREAK 次才能过，也就是这张卡还会再出现至少两次）
+      state.studyStreak[word.word] = 0;
+      addToWrongBook(word.word, word.type, book.id, word.meaning);
       ensureSrs(word).lastReviewed = Date.now();
       nextReviewAfter(word.srs, false);
-      toast(`「${word.word}」已加入错词本`);
+      state.studyQueue.push(word);
+      toast(`「${word.word}」已加入错词本 · 需连续认识 ${STUDY_PASS_STREAK} 次才算过`);
     }
     persist();
     state.studyIndex++;
@@ -689,13 +917,27 @@
     renderStudyCard();
   }
 
-  function addToWrongBook(word, type, sourceBookId) {
+  function addToWrongBook(word, type, sourceBookId, meaning) {
     const existing = state.wrongBook.find(w => w.word === word);
     const entry = window.VocabData.lookup(word);
+    // 计算释义：优先传入的 meaning → 从单词本反查 → entry 拼装（排除占位符）
+    let m = (meaning || '').trim();
+    if (isPlaceholderMeaning(m)) m = '';
+    if (!m) {
+      for (const b of state.books) {
+        const it = b.words.find(x => window.VocabData.normalizeKey(x.word) === window.VocabData.normalizeKey(word));
+        if (it && it.meaning && !isPlaceholderMeaning(it.meaning)) { m = it.meaning.trim(); break; }
+      }
+    }
+    if (!m) {
+      const fromEntry = `${(entry && entry.pos) || ''} ${(entry && entry.cn) || ''}`.trim();
+      if (!isPlaceholderMeaning(fromEntry)) m = fromEntry;
+    }
     if (existing) {
       existing.sources = Array.from(new Set([...(existing.sources || []), sourceBookId]));
       existing.lastSeen = Date.now();
       existing.type = type || existing.type || entry.type || window.VocabData.detectType(word);
+      if (m) existing.meaning = m;
     } else {
       const srs = newSrsRecord();
       srs.nextReview = Date.now() + SRS_INTERVALS[0] * DAY_MS;
@@ -703,6 +945,7 @@
         word,
         type: type || entry.type || window.VocabData.detectType(word),
         entry,
+        meaning: m,
         correctCount: 0,
         sources: [sourceBookId],
         lastSeen: Date.now(),
@@ -712,141 +955,413 @@
     }
   }
 
+  /** 进入错词复习会话；scope 决定"只复习哪一部分错词"（all | book:<id> | orphans） */
+  function startWrongSession(scope) {
+    const s = scope || state.wrongFilter || 'all';
+    state.wrongSessionScope = s;
+    state.activeWrongSession = true;
+    state.studyQueue = [];
+    state.studyIndex = 0;
+    state.studyRevealed = false;
+    state.wrongSpellAnswered = false;
+    state.wrongSpellOk = false;
+    state.wrongSpellInput = '';
+    state._wrongQueueScope = null; // 交给 renderWrongSession 按范围恢复/重建
+    $all('.tab').forEach(t => t.classList.remove('active'));
+    $('.tab[data-tab="study"]').classList.add('active');
+    $all('.panel').forEach(p => p.classList.remove('active'));
+    $('#panel-study').classList.add('active');
+    renderStudy();
+  }
+
+  /** 按范围过滤错词（语法与错词本页面一致：all | book:<id> | orphans） */
+  function filterWrongByScope(list, scope) {
+    if (!scope || scope === 'all') return list;
+    if (scope === 'orphans') return list.filter(w => !w.sources || !w.sources.length);
+    if (scope.startsWith('book:')) {
+      const id = scope.slice(5);
+      return list.filter(w => w.sources && w.sources.includes(id));
+    }
+    return list;
+  }
+
+  /** 错词范围的可读名称 */
+  function wrongScopeLabel(scope) {
+    if (!scope || scope === 'all') return '全部错词';
+    if (scope === 'orphans') return '未归类';
+    if (scope.startsWith('book:')) {
+      const b = state.books.find(x => x.id === scope.slice(5));
+      return b ? `《${b.name}》` : '（已删除词本）';
+    }
+    return scope;
+  }
+
+  /** 错词复习：释义取「错词本自身 meaning」优先，其次 DICT 拼装 */
+  function wrongItemMeaning(w, entry) {
+    let m = (w.meaning || '').trim();
+    if (isPlaceholderMeaning(m)) m = '';
+    if (!m) m = `${(entry && entry.pos) || ''} ${(entry && entry.cn) || ''}`.trim();
+    if (isPlaceholderMeaning(m)) m = '';
+    if (!m) {
+      // 再从单词本反查一次
+      const key = window.VocabData.normalizeKey(w.word);
+      for (const b of state.books) {
+        const it = b.words.find(x => window.VocabData.normalizeKey(x.word) === key);
+        if (it && it.meaning && !isPlaceholderMeaning(it.meaning)) { m = it.meaning.trim(); break; }
+      }
+    }
+    return m;
+  }
+
   function renderWrongSession() {
     const area = $('#studyArea');
-    const due = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+    const allWrong = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+    const scope = state.wrongSessionScope || 'all';
+    const due = filterWrongByScope(allWrong, scope);
+
     if (!due.length) {
+      endCardAudio();
       area.innerHTML = `
         <div class="study-empty">
           <div class="icon">🌟</div>
-          <h3>错词本已清空！</h3>
-          <p>所有错词都已达到"认识 3 次"毕业标准。</p>
-          <div style="margin-top:18px" class="row gap">
+          <h3>「${escapeHtml(wrongScopeLabel(scope))}」范围内没有待复习的错词</h3>
+          <p>该范围的错词都已达到"认识 3 次"毕业标准，或本来就没有错词。</p>
+          <div style="margin-top:18px" class="row gap wrap">
             <button class="btn primary" id="backNormal">回到单词本</button>
-            <button class="btn" id="spellWrongFromCleared">✍ 拼写错词</button>
+            <button class="btn" id="wrongScopeSwitch">🔄 更换范围</button>
           </div>
         </div>`;
       $('#backNormal').addEventListener('click', () => {
         state.activeWrongSession = false;
         renderStudy();
       });
-      $('#spellWrongFromCleared')?.addEventListener('click', () => startSpellScope('wrong'));
+      $('#wrongScopeSwitch')?.addEventListener('click', () => {
+        state.activeWrongSession = false;
+        renderStudy();
+        setTimeout(() => { const p = $('#wrongBookPicker'); if (p) { p.focus(); p.scrollIntoView({ behavior: 'smooth', block: 'center' }); } }, 30);
+      });
       return;
     }
-    if (!state.studyQueue || !state.studyQueue.length || state.studyIndex >= state.studyQueue.length) {
-      state.studyQueue = due.slice();
-      // 随机打乱
-      for (let i = state.studyQueue.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [state.studyQueue[i], state.studyQueue[j]] = [state.studyQueue[j], state.studyQueue[i]];
+
+    // —— 队列准备：内存中的队列若仍属于同一范围则直接续用 ——
+    const saved = state.lastStudyMap && (state.lastStudyMap[wrongStudyKey(scope)] || state.lastStudyMap['wrong']);
+    const savedMatches = saved && (saved.wrongFilter || 'all') === scope;
+    const inMemoryOk = state.studyQueue && state.studyQueue.length
+      && state._wrongQueueScope === scope
+      && state.studyIndex < state.studyQueue.length;
+
+    if (!inMemoryOk) {
+      let rebuilt = null;
+      if (savedMatches && Array.isArray(saved.queue) && saved.queue.length) {
+        const byWord = new Map(due.map(w => [w.word, w]));
+        rebuilt = saved.queue.map(q => byWord.get(q.word)).filter(Boolean);
       }
-      state.studyIndex = 0;
-      state.studyRevealed = false;
+      if (rebuilt && rebuilt.length) {
+        state.studyQueue = rebuilt;
+        state.studyIndex = Math.min(saved.index || 0, rebuilt.length - 1);
+        state.studyRevealed = !!saved.revealed;
+      } else {
+        state.studyQueue = due.slice();
+        for (let i = state.studyQueue.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [state.studyQueue[i], state.studyQueue[j]] = [state.studyQueue[j], state.studyQueue[i]];
+        }
+        state.studyIndex = 0;
+        state.studyRevealed = false;
+      }
+      state._wrongQueueScope = scope;
+      state.wrongSpellAnswered = false;
+      state.studyStreak = {};   // v6：错词复习不共用单词本的「连续认识」计数
       saveLastStudy();
     }
 
+    // 进度耗尽 → 本轮结束
+    if (state.studyIndex >= state.studyQueue.length) {
+      endCardAudio();
+      area.innerHTML = `
+        <div class="study-empty">
+          <div class="icon">✅</div>
+          <h3>本轮错词复习完成！</h3>
+          <p>范围「${escapeHtml(wrongScopeLabel(scope))}」本轮已全部过一遍，继续练可再来一轮。</p>
+          <div style="margin-top:18px" class="row gap wrap">
+            <button class="btn primary" id="wrongRoundAgain">🔁 再来一轮</button>
+            <button class="btn" id="exitWrong">退出错词复习</button>
+          </div>
+        </div>`;
+      $('#wrongRoundAgain').addEventListener('click', () => {
+        state.studyQueue = [];
+        state.studyIndex = 0;
+        state._wrongQueueScope = null;
+        renderWrongSession();
+      });
+      $('#exitWrong').addEventListener('click', () => {
+        state.activeWrongSession = false;
+        state.studyQueue = [];
+        state.studyIndex = 0;
+        state._wrongQueueScope = null;
+        saveLastStudy();
+        renderStudy();
+      });
+      return;
+    }
+
     const w = state.studyQueue[state.studyIndex];
-    const entry = window.VocabData.lookup(w.word);
+    const entry = window.VocabData.lookup(w.word) || {};
     const wrong = state.wrongBook.find(x => x.word === w.word);
     const correctCount = wrong?.correctCount || 0;
     const typeTag = renderTypeTag(w.type);
+    const meaning = wrongItemMeaning(w, entry);
+    const mode = state.wrongCardMode === 'spell' ? 'spell' : 'recall';
+
+    // 顶部：范围选择（可随时更换单词本一起做）
+    const scopeOpts = ['<option value="all">📚 全部错词</option>']
+      .concat(state.books.map(b => {
+        const c = state.wrongBook.filter(x => (x.correctCount || 0) < 3 && x.sources && x.sources.includes(b.id)).length;
+        return `<option value="book:${b.id}" ${scope === 'book:' + b.id ? 'selected' : ''}>《${escapeHtml(b.name)}》(${c})</option>`;
+      }));
+    const orphanAll = state.wrongBook.filter(x => (x.correctCount || 0) < 3 && (!x.sources || !x.sources.length)).length;
+    if (orphanAll) scopeOpts.push(`<option value="orphans" ${scope === 'orphans' ? 'selected' : ''}>📦 未归类（${orphanAll}）</option>`);
 
     $('#studyTitle').textContent = '错词本复习';
-    $('#studySub').textContent = `待毕业 ${due.length} 个 · 本词进度 ${correctCount}/3`;
+    $('#studySub').textContent = `范围：${wrongScopeLabel(scope)} · 待毕业 ${due.length} 个 · 本词进度 ${correctCount}/3`;
 
     const pct = (state.studyIndex / state.studyQueue.length) * 100;
+    const spellAnswered = !!state.wrongSpellAnswered;
+    const spellOk = !!state.wrongSpellOk;
+
     area.innerHTML = `
       <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
-      <div class="flashcard">
+
+      <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <span class="muted small">复习范围：</span>
+        <select id="wrongScopeSelect" class="select" style="min-width:170px">${scopeOpts.join('')}</select>
+        <span class="muted small">答对 3 次即毕业</span>
+        <span class="grow"></span>
+        <button class="btn small-btn ${mode === 'spell' ? 'primary' : ''}" id="wrongModeToggle">
+          ${mode === 'spell' ? '🎴 改回认词模式' : '✍ 拼写这道题'}
+        </button>
+      </div>
+
+      <div class="flashcard spell-card">
         <div class="card-actions">
           ${Speech.button(w.word, { small: true })}
           <button class="edit-btn" id="editCardBtn" title="修正这个词的释义">✏ 编辑</button>
         </div>
         <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · ${correctCount}/3 · ${typeTag}</div>
-        <div class="word ${w.type === 'sentence' ? 'sentence' : (w.type === 'phrase' ? 'phrase' : '')}">${escapeHtml(w.word)}</div>
-        ${entry.phonetic ? `<div class="phonetic">${escapeHtml(entry.phonetic)}</div>` : `<div class="phonetic muted">（暂无音标）</div>`}
-        ${state.studyRevealed
-          ? `
-            <div class="meaning">${escapeHtml(`${entry.pos || ''} ${entry.cn || ''}`.trim() || w.entry?.meaning || '（暂无释义）')}</div>
-            ${(w.example || entry.example) ? `<div class="example">${escapeHtml(w.example || entry.example)}</div>` : ''}
-          `
-          : `<button class="reveal-btn" id="revealBtn">显示释义</button>`
-        }
+
+        ${mode === 'recall' ? `
+          <div class="word ${w.type === 'sentence' ? 'sentence' : (w.type === 'phrase' ? 'phrase' : '')}">${escapeHtml(w.word)}</div>
+          ${entry.phonetic ? `<div class="phonetic">${escapeHtml(entry.phonetic)}</div>` : `<div class="phonetic muted">（暂无音标）</div>`}
+          ${state.studyRevealed
+            ? `
+              <div class="meaning">${escapeHtml(meaning || '（暂无释义，可点右上角 ✏ 补充）')}</div>
+              ${(w.example || entry.example) ? `<div class="example">${escapeHtml(w.example || entry.example)}</div>` : ''}
+            `
+            : `<button class="reveal-btn" id="revealBtn">显示释义</button>`
+          }
+        ` : `
+          <div class="spell-blank-stage">
+            <div class="blank-icon">🎧</div>
+            <div class="blank-hint">${w.type === 'sentence' ? '请拼写下面的英文句子' : w.type === 'phrase' ? '请拼写下面的英文短语（保留空格）' : '请拼写下面的英文单词'}</div>
+            <button class="btn-listen-big" id="wrongSpellPlay" type="button">
+              <span class="play-glyph">▶</span>
+              <span class="play-label">播放发音</span>
+            </button>
+          </div>
+          ${spellAnswered ? `
+            <div class="spell-reveal ${spellOk ? 'is-correct' : 'is-wrong'}">
+              <div class="reveal-banner ${spellOk ? 'ok-banner' : 'wrong-banner'}">
+                ${spellOk ? '<span class="ok-text">✓ 拼写正确 · 已累计 +1</span>' : '<span class="bad-text">✗ 拼错了 · 进度已重置</span>'}
+              </div>
+              <div class="reveal-correct ${spellOk ? '' : 'reveal-correct-wrong'}">
+                <span class="muted small">你的答案：</span>
+                <span class="${spellOk ? 'ok-text' : 'bad-text'}">${escapeHtml(state.wrongSpellInput || '（空）')}</span>
+              </div>
+              <div class="reveal-correct reveal-correct-wrong">
+                <span class="reveal-label">正确答案</span>
+                <span class="correct-word">${escapeHtml(w.word)}</span>
+                ${Speech.button(w.word, { small: true })}
+              </div>
+              <div class="reveal-meaning-block">
+                <div class="meaning-label muted small">中文释义</div>
+                <div class="meaning-line">${escapeHtml(meaning || '（暂无释义，可点右上角 ✏ 补充）')}</div>
+                ${entry.phonetic ? `<div class="phonetic">/${escapeHtml(entry.phonetic)}/</div>` : ''}
+              </div>
+            </div>
+          ` : `
+            <div class="spell-input-row">
+              <input id="wrongSpellInput" class="input" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="输入后按 Enter 提交" />
+              <button class="btn primary" id="wrongSpellSubmit">提交 ✍️</button>
+            </div>
+          `}
+        `}
       </div>
-      ${state.studyRevealed ? `
+
+      ${mode === 'recall' && state.studyRevealed ? `
         <div class="actions">
           <button class="btn unknow" id="btnUnknow">不认识</button>
           <button class="btn know" id="btnKnow">认识 +1 (${correctCount + 1}/3)</button>
         </div>
       ` : ''}
-      <div style="text-align:center;margin-top:14px" class="row gap">
+      ${mode === 'spell' && spellAnswered ? `
+        <div class="actions">
+          <button class="btn primary" id="wrongNext">下一题 ➜</button>
+        </div>
+      ` : ''}
+
+      <div style="text-align:center;margin-top:14px" class="row gap wrap">
         <button class="btn ghost" id="exitWrong">退出错词复习</button>
-        <button class="btn" id="spellWrongHere">✍ 拼写模式</button>
+        <button class="btn" id="spellWrongHere">✍ 整轮拼写模式</button>
       </div>
     `;
 
-    // 词卡一出现就自动发音（英式）。可在偏好里关闭：Ctrl/Cmd+Shift+S
-    // 不放 setTimeout：保持用户点击栈内的 user activation（Chrome 才有声音）
-    if (state.autoSpeak) {
-      try { Speech.speak(w.word); } catch (e) {}
-      if (!sessionStorage.getItem('__autospk_hinted')) {
-        sessionStorage.setItem('__autospk_hinted', '1');
-        toast('🔊 已开启自动英式朗读 · 点 🔊 可单独再读 · Ctrl/Cmd+Shift+S 关闭');
-      }
+    // v6：音频跟随词卡 —— 换词停旧音频，新卡出现自动朗读
+    // 拼写模式下不自动朗读（会剧透答案），但仍然负责"换词即停"
+    syncCardAudio(w.word, { silent: mode === 'spell' });
+    if (state.autoSpeak && !state.audioMuted && mode === 'recall' && !state.studyRevealed
+        && !sessionStorage.getItem('__autospk_hinted')) {
+      sessionStorage.setItem('__autospk_hinted', '1');
+      toast('🔊 已开启自动英式朗读 · 点 🔊 可单独再读 · 顶部 🔊 可一键静音');
     }
+
+    // —— 范围切换：整轮进度按新范围重新开始，但各范围进度各自保留 ——
+    $('#wrongScopeSelect').addEventListener('change', (e) => {
+      state.wrongSessionScope = e.target.value;
+      state.studyQueue = [];
+      state.studyIndex = 0;
+      state.studyRevealed = false;
+      state.wrongSpellAnswered = false;
+      state._wrongQueueScope = null;
+      renderWrongSession();
+    });
+
+    // —— 模式切换 ——
+    $('#wrongModeToggle').addEventListener('click', () => {
+      state.wrongCardMode = mode === 'spell' ? 'recall' : 'spell';
+      state.wrongSpellAnswered = false;
+      state.studyRevealed = false;
+      renderWrongSession();
+    });
 
     $('#editCardBtn')?.addEventListener('click', (e) => {
       e.stopPropagation();
       openEditModal({
         word: w.word,
-        meaning: `${entry.pos || ''} ${entry.cn || ''}`.trim(),
-        example: entry.example || w.example || '',
+        meaning: meaning || `${entry.pos || ''} ${entry.cn || ''}`.trim(),
+        example: w.example || entry.example || '',
         scope: 'word'
       });
     });
 
-    if (!state.studyRevealed) {
-      $('#revealBtn').addEventListener('click', () => { state.studyRevealed = true; renderWrongSession(); });
-    } else {
-      $('#btnUnknow').addEventListener('click', () => {
-        if (wrong) {
-          wrong.correctCount = 0;
-          wrong.lastSeen = Date.now();
-          nextReviewAfter(ensureSrs(wrong), false);
-        }
-        persist();
-        toast(`已重置「${w.word}」的累计进度`);
-        state.studyIndex++;
-        state.studyRevealed = false;
-        saveLastStudy();
-        renderWrongSession();
-      });
-      $('#btnKnow').addEventListener('click', () => {
-        if (wrong) {
-          wrong.correctCount = (wrong.correctCount || 0) + 1;
-          wrong.lastSeen = Date.now();
-          nextReviewAfter(ensureSrs(wrong), true);
-          if (wrong.correctCount >= 3) {
-            state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
-            toast(`「${w.word}」已毕业！`);
+    if (mode === 'recall') {
+      if (!state.studyRevealed) {
+        $('#revealBtn').addEventListener('click', () => { state.studyRevealed = true; renderWrongSession(); });
+      } else {
+        $('#btnUnknow').addEventListener('click', () => {
+          if (wrong) {
+            wrong.correctCount = 0;
+            wrong.lastSeen = Date.now();
+            nextReviewAfter(ensureSrs(wrong), false);
           } else {
-            toast(`「${w.word}」进度 ${wrong.correctCount}/3`);
+            // 该词可能刚毕业又被判不认识 → 重新拉回错词本
+            addToWrongBook(w.word, w.type, (w.sources && w.sources[0]) || w.sourceBookId, w.meaning);
           }
+          persist();
+          // v6：不认识的错词重新排回本轮队尾，本轮里还会再出现（不必等到下一轮）
+          state.studyQueue.push(w);
+          toast(`已重置「${w.word}」的累计进度 · 本轮稍后会再出现`);
+          state.studyIndex++;
+          state.studyRevealed = false;
+          saveLastStudy();
+          renderWrongSession();
+        });
+        $('#btnKnow').addEventListener('click', () => {
+          if (wrong) {
+            wrong.correctCount = (wrong.correctCount || 0) + 1;
+            wrong.lastSeen = Date.now();
+            nextReviewAfter(ensureSrs(wrong), true);
+            if (wrong.correctCount >= 3) {
+              state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
+              // v6：毕业了就把它在本轮队列里还没轮到的副本一并清掉
+              state.studyQueue = state.studyQueue.filter((x, i) => i < state.studyIndex || x.word !== w.word);
+              toast(`「${w.word}」已毕业！`);
+            } else {
+              toast(`「${w.word}」进度 ${wrong.correctCount}/3`);
+            }
+          }
+          persist();
+          state.studyIndex++;
+          state.studyRevealed = false;
+          saveLastStudy();
+          renderWrongSession();
+        });
+      }
+    } else {
+      const playBtn = $('#wrongSpellPlay');
+      if (playBtn) playBtn.addEventListener('click', () => manualSpeak(w.word));
+
+      if (spellAnswered) {
+        $('#wrongNext').addEventListener('click', () => {
+          state.studyIndex++;
+          state.wrongSpellAnswered = false;
+          state.wrongSpellOk = false;
+          state.wrongSpellInput = '';
+          saveLastStudy();
+          renderWrongSession();
+        });
+      } else {
+        const inp = $('#wrongSpellInput');
+        if (inp) inp.focus();
+        const submit = () => {
+          const v = (inp.value || '').trim();
+          const ok = v !== '' && normalizeForCompare(v) === normalizeForCompare(w.word);
+          state.wrongSpellAnswered = true;
+          state.wrongSpellOk = ok;
+          state.wrongSpellInput = v || '（空）';
+          if (wrong) {
+            if (ok) {
+              wrong.correctCount = (wrong.correctCount || 0) + 1;
+              wrong.lastSeen = Date.now();
+              nextReviewAfter(ensureSrs(wrong), true);
+              if (wrong.correctCount >= 3) {
+                state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
+                toast(`「${w.word}」已毕业！`);
+              } else {
+                toast(`✓ 拼对了 ·「${w.word}」进度 ${wrong.correctCount}/3`);
+              }
+            } else {
+              wrong.correctCount = 0;
+              wrong.lastSeen = Date.now();
+              nextReviewAfter(ensureSrs(wrong), false);
+              toast(`✗ 拼错了，「${w.word}」进度已重置`);
+            }
+          }
+          persist();
+          saveLastStudy();
+          renderWrongSession();
+        };
+        $('#wrongSpellSubmit').addEventListener('click', submit);
+        if (inp) {
+          inp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              submit();
+            }
+          });
         }
-        persist();
-        state.studyIndex++;
-        state.studyRevealed = false;
-        saveLastStudy();
-        renderWrongSession();
-      });
+      }
     }
+
     $('#exitWrong').addEventListener('click', () => {
       state.activeWrongSession = false;
       state.studyQueue = [];
       state.studyIndex = 0;
+      state._wrongQueueScope = null;
       renderStudy();
     });
-    $('#spellWrongHere')?.addEventListener('click', () => startSpellScope('wrong'));
+    $('#spellWrongHere')?.addEventListener('click', () => startSpellScope(scope === 'all' ? 'wrong' : scope));
   }
 
   function bindStudy() {
@@ -865,12 +1380,11 @@
       toast('已重置进度');
     });
     $('#studyWrong').addEventListener('click', () => {
-      state.activeWrongSession = true;
-      $all('.tab').forEach(t => t.classList.remove('active'));
-      $('.tab[data-tab="study"]').classList.add('active');
-      $all('.panel').forEach(p => p.classList.remove('active'));
-      $('#panel-study').classList.add('active');
-      renderStudy();
+      // v5.9：只复习「错词本页面当前选中范围」的错词（跟随上方下拉）
+      const picker = $('#wrongBookPicker');
+      const scope = (picker && picker.value) ? picker.value : (state.wrongFilter || 'all');
+      state.wrongFilter = scope;
+      startWrongSession(scope);
     });
   }
 
@@ -959,6 +1473,9 @@
 
           // 3) 清理 lastStudy：若指向上述词本，则清空
           if (state.lastStudy?.activeBookId === id) state.lastStudy = null;
+
+          // 3.5) v5.9：同步清理三个分片进度 map 里对该书的引用
+          purgeBookFromProgressMaps(id);
 
           // 4) 清理 lastSpell：若 scope 是该本或队列含仅来自该本的项目
           if (state.lastSpell) {
@@ -1076,12 +1593,18 @@
         })),
         wrongBook: state.wrongBook,
         userDict: state.userDict,
-        lastStudy: state.lastStudy,
-        lastSpell: state.lastSpell,
+        lastStudy: attachMap(state.lastStudy, state.lastStudyMap),
+        lastSpell: attachMap(state.lastSpell, state.lastSpellMap),
+        lastListen: attachMap(state.lastListen, state.lastListenMap),
         prefs: {
           autoSpeak: state.autoSpeak,
           wrongFilter: state.wrongFilter,
-          reviewFilter: state.reviewFilter
+          reviewFilter: state.reviewFilter,
+          activeBookId: state.activeBookId,
+          spellScope: state.spellScope,
+          listenScope: state.listenScope,
+          wrongSessionScope: state.wrongSessionScope,
+          wrongCardMode: state.wrongCardMode
         }
       };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1213,9 +1736,37 @@
     };
   }
 
+  /** v5.9：删除单词本时，同步清理三个分片进度 map 里对它的引用 */
+  function purgeBookFromProgressMaps(bookId) {
+    const purge = (map, keyIsBook) => {
+      if (!map) return;
+      for (const k of Object.keys(map)) {
+        if (keyIsBook(k, bookId)) { delete map[k]; continue; }
+        const snap = map[k];
+        if (snap && Array.isArray(snap.queue)) {
+          const remaining = snap.queue.filter(it => !it.sourceBookId || it.sourceBookId !== bookId);
+          if (!remaining.length) { delete map[k]; continue; }
+          snap.queue = remaining;
+          if ((snap.index || 0) >= remaining.length) snap.index = Math.max(0, remaining.length - 1);
+        }
+      }
+    };
+    purge(state.lastStudyMap, (k, id) => k === id || k === 'wrong|book:' + id || k === 'wrong');
+    purge(state.lastSpellMap, (k, id) => k === 'book:' + id);
+    purge(state.lastListenMap, (k, id) => k === 'book:' + id);
+  }
+
+  /** v5.9：把 incoming 的分片进度合并进 target（已存在的 key 不覆盖，保护本地进行中的进度） */
+  function mergeProgressMap(target, incoming) {
+    if (!incoming || typeof incoming !== 'object') return;
+    for (const k of Object.keys(incoming)) {
+      if (!target[k]) target[k] = incoming[k];
+    }
+  }
+
   // 真正把数据写入 state 并持久化、重新渲染
   function applyImport(payload, merge) {
-    const { books: incBooks, wrong: incWrong, userDict, lastStudy, lastSpell, prefs } = payload;
+    const { books: incBooks, wrong: incWrong, userDict, lastStudy, lastSpell, lastListen, prefs } = payload;
 
     // 1. 用户字典：永远合并
     if (userDict) {
@@ -1266,14 +1817,24 @@
     }
 
     // 4. 进度：仅在本地为空时才接受导入的进度（避免覆盖当前进行中的状态）
-    if (!state.lastStudy && lastStudy) state.lastStudy = lastStudy;
-    if (!state.lastSpell && lastSpell) state.lastSpell = lastSpell;
+    // v5.9：同时接收「按单词本分片」的进度 map（已有的分片不被覆盖）
+    if (!state.lastStudy && stripMap(lastStudy)) state.lastStudy = stripMap(lastStudy);
+    if (!state.lastSpell && stripMap(lastSpell)) state.lastSpell = stripMap(lastSpell);
+    if (!state.lastListen && stripMap(lastListen)) state.lastListen = stripMap(lastListen);
+    mergeProgressMap(state.lastStudyMap, readMap(lastStudy));
+    mergeProgressMap(state.lastSpellMap, readMap(lastSpell));
+    mergeProgressMap(state.lastListenMap, readMap(lastListen));
 
     // 5. 偏好：仅在本地无设置时采用
     if (prefs) {
       if (prefs.autoSpeak === false) state.autoSpeak = false;
       if (!state.wrongFilter && prefs.wrongFilter) state.wrongFilter = prefs.wrongFilter;
       if (!state.reviewFilter && prefs.reviewFilter) state.reviewFilter = prefs.reviewFilter;
+      if (!state.activeBookId && prefs.activeBookId) state.activeBookId = prefs.activeBookId;
+      if (!state.spellScope && prefs.spellScope) state.spellScope = prefs.spellScope;
+      if (!state.listenScope && prefs.listenScope) state.listenScope = prefs.listenScope;
+      if (prefs.wrongSessionScope) state.wrongSessionScope = prefs.wrongSessionScope;
+      if (prefs.wrongCardMode) state.wrongCardMode = prefs.wrongCardMode;
     }
 
     persist();
@@ -1353,6 +1914,15 @@
 
     // 更新「清空错词」按钮的文案，按当前过滤范围区分
     updateClearWrongButton(filter, items.length);
+
+    // v5.9：让「开始复习错词」按钮明确显示将复习的范围
+    const swBtn = $('#studyWrong');
+    if (swBtn) {
+      const label = wrongScopeLabel(filter);
+      swBtn.textContent = items.length
+        ? `开始复习错词（${label} · ${items.length}）`
+        : `开始复习错词（${label}）`;
+    }
 
     // 分组（按单词本），便于一眼看到"这本词本欠我多少"
     const groups = {};
@@ -1540,8 +2110,19 @@
       if (items.find(x => x.word === key)) return;
       const entry = window.VocabData.lookup(word);
       const srs = source.srs ? JSON.parse(JSON.stringify(source.srs)) : newSrsRecord();
-      // 释义：优先源数据里用户填的 meaning，其次 DICT 拼装
+      // 释义：优先源数据里用户填的 meaning（排除占位符）→ 从单词本反查 → DICT 拼装
       let meaning = (source.meaning || '').trim();
+      if (isPlaceholderMeaning(meaning)) meaning = '';
+      if (!meaning) {
+        const preferredBookId = source.sourceBookId;
+        const booksToSearch = preferredBookId
+          ? [state.books.find(b => b.id === preferredBookId)].filter(Boolean)
+          : state.books;
+        for (const b of booksToSearch) {
+          const it = b.words.find(w => window.VocabData.normalizeKey(w.word) === key);
+          if (it && it.meaning && !isPlaceholderMeaning(it.meaning)) { meaning = it.meaning.trim(); break; }
+        }
+      }
       if (!meaning) meaning = `${(entry && entry.pos) || ''} ${(entry && entry.cn) || ''}`.trim();
       items.push({
         word,
@@ -1632,6 +2213,94 @@
     return scope;
   }
 
+  /** 用保存的快照重建拼写队列；返回 null 表示无法完整还原 */
+  function rebuildSpellItems(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.queue) || !snapshot.queue.length) return null;
+    const rebuilt = snapshot.queue.map(q => {
+      if (!q || !q.word) return null;
+      const entry = window.VocabData.lookup(q.word);
+      // 合并最新的 srs 信息（如果在单词本/错词本里仍然存在）
+      let liveSrs = q.srs;
+      let wrong = null;
+      let sourceBookId = q.sourceBookId;
+      if (q.sourceBookId) {
+        const b = state.books.find(x => x.id === q.sourceBookId);
+        if (b) {
+          const item = b.words.find(w => window.VocabData.normalizeKey(w.word) === window.VocabData.normalizeKey(q.word));
+          if (item && item.srs) liveSrs = item.srs;
+        }
+      } else {
+        wrong = state.wrongBook.find(w => window.VocabData.normalizeKey(w.word) === window.VocabData.normalizeKey(q.word)) || null;
+        if (wrong && wrong.srs) liveSrs = wrong.srs;
+      }
+      // 释义：优先用保存的（排除占位符）→ 从错词本/单词本反查最新 → entry 拼装
+      let meaning = (q.meaning || '').trim();
+      if (isPlaceholderMeaning(meaning)) meaning = '';
+      if (!meaning && wrong && wrong.meaning && !isPlaceholderMeaning(wrong.meaning)) {
+        meaning = wrong.meaning.trim();
+      }
+      if (!meaning) {
+        const srcBook = state.books.find(x => x.id === q.sourceBookId);
+        const srcWord = srcBook && srcBook.words.find(w => window.VocabData.normalizeKey(w.word) === window.VocabData.normalizeKey(q.word));
+        if (srcWord && srcWord.meaning && !isPlaceholderMeaning(srcWord.meaning)) meaning = srcWord.meaning.trim();
+      }
+      if (!meaning) {
+        for (const b of state.books) {
+          const it = b.words.find(w => window.VocabData.normalizeKey(w.word) === window.VocabData.normalizeKey(q.word));
+          if (it && it.meaning && !isPlaceholderMeaning(it.meaning)) { meaning = it.meaning.trim(); break; }
+        }
+      }
+      if (!meaning) meaning = `${(entry && entry.pos) || ''} ${(entry && entry.cn) || ''}`.trim();
+      const item = {
+        word: q.word,
+        key: q.key || window.VocabData.normalizeKey(q.word),
+        type: q.type || entry.type || window.VocabData.detectType(q.word),
+        entry,
+        srs: liveSrs || newSrsRecord(),
+        sourceBookId,
+        wrong,
+        meaning
+      };
+      // 恢复上次答题结果，确保刷新后仍能看到正确答案
+      if (q._lastOk !== undefined) item._lastOk = q._lastOk;
+      if (q._userInput !== undefined) item._userInput = q._userInput;
+      return item;
+    }).filter(Boolean);
+    if (rebuilt.length !== snapshot.queue.length) return null;
+    return rebuilt;
+  }
+
+  /** 尝试恢复某个 scope 的拼写进度（v5.9：每个单词本 / 来源各自保存） */
+  function tryRestoreSpell(scope) {
+    if (!scope) return false;
+    const snap = (state.lastSpellMap && state.lastSpellMap[scope])
+      || (state.lastSpell && state.lastSpell.scope === scope ? state.lastSpell : null);
+    const items = rebuildSpellItems(snap);
+    if (!items || !items.length) return false;
+    const idx = Math.min(snap.index || 0, items.length - 1);
+    if (idx < 0) return false;
+    state.spellScope = scope;
+    state.spellQueue = items;
+    state.spellIndex = idx;
+    state.spellAnswered = !!snap.answered;
+    state.spellSource = spellSourceLabel(scope);
+    state._spellSpeakOnNext = false; // 恢复进度时不再重播
+    return true;
+  }
+
+  /** 切换拼写范围：有历史进度就恢复，没有才开始新一轮 */
+  function goSpellScope(scope, sel) {
+    state.spellScope = scope;
+    if (sel) sel.value = scope;
+    if (tryRestoreSpell(scope)) {
+      persist(); // 记住本次选择的范围，刷新后可直接续上
+      renderSpellCard();
+      toast(`↩ 已恢复「${spellSourceLabel(scope)}」的拼写进度`);
+    } else {
+      startSpellScope(scope);
+    }
+  }
+
   function renderSpellInit() {
     // 渲染模式 select 与初始界面
     const sel = $('#spellScopeSelect');
@@ -1645,12 +2314,9 @@
 
     $('#spellRefresh').onclick = () => {
       state.spellScope = sel.value;
-      startSpellScope(state.spellScope);
+      startSpellScope(state.spellScope); // 明确「重新生成队列」
     };
-    sel.onchange = () => {
-      state.spellScope = sel.value;
-      startSpellScope(state.spellScope);
-    };
+    sel.onchange = () => goSpellScope(sel.value, sel);
 
     if (!state.spellScope) state.spellScope = 'due';
     sel.value = state.spellScope;
@@ -1669,77 +2335,19 @@
     $('#spellBookGo').onclick = () => {
       const id = picker.value;
       if (!id) { toast('请先选择一个单词本'); return; }
-      startSpellScope('book:' + id);
+      goSpellScope('book:' + id, sel);
     };
 
     // 快捷按钮
     $all('[data-spell-scope]').forEach(btn => {
-      btn.onclick = () => startSpellScope(btn.dataset.spellScope);
+      btn.onclick = () => goSpellScope(btn.dataset.spellScope, sel);
     });
 
-    // v5：恢复拼写进度
-    if (state.lastSpell && Array.isArray(state.lastSpell.queue) && state.lastSpell.queue.length) {
-      const scope = state.lastSpell.scope;
-      const validScope = (
-        scope === 'due' || scope === 'wrong' || scope === 'all' ||
-        (scope.startsWith('book:') && state.books.find(b => b.id === scope.slice(5)))
-      );
-      if (validScope) {
-        // 1) 尝试按保存的 queue 重建完整 items（保持拼写时的顺序与对象）
-        const rebuilt = state.lastSpell.queue.map(q => {
-          if (!q || !q.word) return null;
-          const entry = window.VocabData.lookup(q.word);
-          // 合并最新的 srs 信息（如果在单词本/错词本里仍然存在）
-          let liveSrs = q.srs;
-          let wrong = null;
-          let sourceBookId = q.sourceBookId;
-          if (q.sourceBookId) {
-            const b = state.books.find(x => x.id === q.sourceBookId);
-            if (b) {
-              const item = b.words.find(w => window.VocabData.normalizeKey(w.word) === window.VocabData.normalizeKey(q.word));
-              if (item && item.srs) liveSrs = item.srs;
-            }
-          } else {
-            wrong = state.wrongBook.find(w => window.VocabData.normalizeKey(w.word) === window.VocabData.normalizeKey(q.word)) || null;
-            if (wrong && wrong.srs) liveSrs = wrong.srs;
-          }
-          // 释义：优先用保存的，否则重新拼装
-          let meaning = (q.meaning || '').trim();
-          if (!meaning) meaning = `${(entry && entry.pos) || ''} ${(entry && entry.cn) || ''}`.trim();
-          const item = {
-            word: q.word,
-            key: q.key || window.VocabData.normalizeKey(q.word),
-            type: q.type || entry.type || window.VocabData.detectType(q.word),
-            entry,
-            srs: liveSrs || newSrsRecord(),
-            sourceBookId,
-            wrong,
-            meaning
-          };
-          // 恢复上次答题结果，确保刷新后仍能看到正确答案
-          if (q._lastOk !== undefined) item._lastOk = q._lastOk;
-          if (q._userInput !== undefined) item._userInput = q._userInput;
-          return item;
-        }).filter(Boolean);
-
-        // 2) 如果所有项都能从保存的 queue 还原 → 直接用；否则用 collectSpellItems 新生成
-        let items = rebuilt;
-        if (rebuilt.length !== state.lastSpell.queue.length) {
-          items = collectSpellItems(scope);
-        }
-        const idx = Math.min(state.lastSpell.index || 0, items.length - 1);
-        if (items.length > 0 && idx >= 0) {
-          state.spellScope = scope;
-          sel.value = scope;
-          state.spellQueue = items;
-          state.spellIndex = idx;
-          state.spellAnswered = !!state.lastSpell.answered;
-          state.spellSource = spellSourceLabel(scope);
-          state._spellSpeakOnNext = false; // 恢复进度时不再重播
-          renderSpellCard();
-          return;
-        }
-      }
+    // v5.9：恢复「当前 scope」的拼写进度（每个单词本各自保存，切换不丢）
+    if (tryRestoreSpell(state.spellScope)) {
+      sel.value = state.spellScope;
+      renderSpellCard();
+      return;
     }
     renderSpellLanding();
   }
@@ -1818,9 +2426,9 @@
     renderSpellCard();
   }
 
-  /** 保存当前拼写进度到 state.lastSpell 并 persist */
+  /** 保存当前拼写进度到 state.lastSpell（最近一次）+ lastSpellMap（按范围分片）并 persist */
   function saveLastSpell() {
-    state.lastSpell = {
+    const snapshot = {
       scope: state.spellScope,
       // 保存完整队列（包含 srs / meaning / 答题结果），恢复时不依赖 collectSpellItems 排序
       queue: state.spellQueue.map(w => ({
@@ -1836,6 +2444,11 @@
       index: state.spellIndex,
       answered: !!state.spellAnswered
     };
+    state.lastSpell = snapshot;
+    // v5.9：按 scope 分片保存 —— 每个单词本 / 每个来源的进度互不覆盖
+    if (state.spellScope) {
+      state.lastSpellMap[state.spellScope] = JSON.parse(JSON.stringify(snapshot));
+    }
     persist();
   }
 
@@ -1996,17 +2609,25 @@
     // 自动朗读（英式）+ 自动聚焦输入框。自动朗读可关闭：Ctrl/Cmd+Shift+S
     // 不放 setTimeout 包裹 speak：保持用户点击栈内的 user activation（Chrome 才有声音）
     // 但仅在切到拼写 tab 或开始新题时才放声，恢复进度时不重复播
-    if (state._spellSpeakOnNext) {
-      state._spellSpeakOnNext = false;
-      if (state.autoSpeak) { try { Speech.speak(w.word); } catch (e) {} }
+    // v6：音频跟随词卡 —— 必须先"换词即停 + 登记新词"，再决定要不要朗读
+    // 拼写模式下不自动朗读（会剧透答案），仅在新题开始时按开关朗读
+    if (state.spellAnswered) {
+      // 已经揭晓答案 → 停止发音（单词"消失"了，声音也跟着消失）
+      endCardAudio();
+    } else {
+      syncCardAudio(w.word, { silent: true });
+      if (state._spellSpeakOnNext) {
+        state._spellSpeakOnNext = false;
+        if (state.autoSpeak) manualSpeak(w.word);
+      }
     }
     const _inp = $('#spellInput');
     if (_inp && !state.spellAnswered) _inp.focus();
 
     // 顶部 / 白板区域的播放按钮
-    $('#spellSpeakAgain').onclick = () => Speech.speak(w.word);
+    $('#spellSpeakAgain').onclick = () => manualSpeak(w.word);
     const _playMain = $('#spellPlayMain');
-    if (_playMain) _playMain.onclick = () => Speech.speak(w.word);
+    if (_playMain) _playMain.onclick = () => manualSpeak(w.word);
 
     const onCheck = () => {
       const v = $('#spellInput').value;
@@ -2025,12 +2646,28 @@
         if (!w.wrong) {
           w.wrong = state.wrongBook.find(x => x.word === w.word) || null;
         }
-        // 如果在错词本里：累计 +1
+        // 如果在错词本里：累计 +1，并回填释义（防止旧数据 meaning 为空）
         if (w.wrong) {
           w.wrong.correctCount = (w.wrong.correctCount || 0) + 1;
           w.wrong.lastSeen = Date.now();
           ensureSrs(w.wrong);
           nextReviewAfter(w.wrong.srs, true);
+          if (!w.wrong.meaning || isPlaceholderMeaning(w.wrong.meaning)) {
+            let m = (w.meaning || '').trim();
+            if (isPlaceholderMeaning(m)) m = '';
+            if (!m && w.sourceBookId) {
+              const b = state.books.find(x => x.id === w.sourceBookId);
+              const it = b && b.words.find(x => window.VocabData.normalizeKey(x.word) === w.key);
+              if (it && it.meaning && !isPlaceholderMeaning(it.meaning)) m = it.meaning.trim();
+            }
+            if (!m) {
+              for (const b of state.books) {
+                const it = b.words.find(x => window.VocabData.normalizeKey(x.word) === w.key);
+                if (it && it.meaning && !isPlaceholderMeaning(it.meaning)) { m = it.meaning.trim(); break; }
+              }
+            }
+            if (m) w.wrong.meaning = m;
+          }
           if (w.wrong.correctCount >= 3) {
             state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
             toast(`「${w.word}」已从错词本毕业！`);
@@ -2050,7 +2687,7 @@
         nextReviewAfter(w.srs, false);
         w.srs.lastReviewed = Date.now();
         // 进入错词本（首次错时新增，已存在则合并 sources）
-        addToWrongBook(w.word, w.type, w.sourceBookId);
+        addToWrongBook(w.word, w.type, w.sourceBookId, w.meaning);
         // 关键修复：回写 w.wrong 引用，让"重答答对"时能累计 correctCount 直至毕业
         w.wrong = state.wrongBook.find(x => x.word === w.word);
         if (w.wrong) {
@@ -2087,7 +2724,7 @@
       w._lastOk = false;
       w._userInput = '';
       nextReviewAfter(w.srs, false);
-      addToWrongBook(w.word, w.type, w.sourceBookId);
+      addToWrongBook(w.word, w.type, w.sourceBookId, w.meaning);
       for (const b of state.books) {
         const item = b.words.find(it => window.VocabData.normalizeKey(it.word) === w.key);
         if (item) { ensureSrs(item); nextReviewAfter(item.srs, false); }
@@ -2172,7 +2809,7 @@
           const inp = $('#spellInput');
           if (inp) {
             inp.focus();
-            try { Speech.speak(w.word); } catch (e) {}
+            manualSpeak(w.word);
           }
         }, 60);
       };
@@ -2243,7 +2880,7 @@
 
   function saveLastListen() {
     // 仅保存元数据，恢复时按 word 反查
-    state.lastListen = state.listenQueue.length ? {
+    const snapshot = state.listenQueue.length ? {
       scope: state.listenScope,
       index: state.listenIndex,
       answered: state.listenAnswered,
@@ -2253,7 +2890,26 @@
         sourceBookId: it.sourceBookId
       }))
     } : null;
+    state.lastListen = snapshot;
+    // v5.9：按 scope 分片保存 —— 换单词本再换回来，听音进度仍在
+    if (snapshot && state.listenScope) {
+      state.lastListenMap[state.listenScope] = JSON.parse(JSON.stringify(snapshot));
+    }
     persist();
+  }
+
+  /** 进入指定范围的听音（供复习页 / 快捷入口调用） */
+  function startListenScope(scope) {
+    state.listenScope = scope || 'all';
+    state.listenQueue = [];
+    state.listenIndex = 0;
+    state.listenAnswered = false;
+    $all('.tab').forEach(t => t.classList.remove('active'));
+    $('.tab[data-tab="listen"]').classList.add('active');
+    $all('.panel').forEach(p => p.classList.remove('active'));
+    $('#panel-listen').classList.add('active');
+    renderListenInit();
+    startListen();
   }
 
   function renderListenInit() {
@@ -2296,7 +2952,7 @@
     if (repBtn) {
       repBtn.onclick = () => {
         const cur = state.listenQueue[state.listenIndex];
-        if (cur) Speech.speak(cur.word);
+        if (cur) manualSpeak(cur.word);
         else toast('请先选择单词本开始');
       };
     }
@@ -2333,20 +2989,22 @@
       return;
     }
 
-    // 如果之前有保存的进度且 scope 一致，尝试恢复到原位
-    if (state.lastListen && state.lastListen.scope === scope && state.lastListen.queue?.length) {
-      const savedMap = new Map(state.lastListen.queue.map(it => [it.key, it]));
+    // v5.9：优先用「本 scope 专属」的进度快照恢复（换单词本再换回来，进度也不丢）
+    const saved = (state.lastListenMap && state.lastListenMap[scope])
+      || (state.lastListen && state.lastListen.scope === scope ? state.lastListen : null);
+    if (saved && saved.queue && saved.queue.length) {
+      const savedMap = new Map(saved.queue.map(it => [it.key, it]));
       const merged = [];
       for (const it of items) {
         const sv = savedMap.get(it.key);
         merged.push(sv ? { ...it, savedAt: sv } : it);
       }
       // 按上次 queue 顺序排序，未出现的 append
-      const order = state.lastListen.queue.map(q => q.key);
+      const order = saved.queue.map(q => q.key);
       merged.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
       state.listenQueue = merged;
-      state.listenIndex = Math.min(state.lastListen.index || 0, state.listenQueue.length - 1);
-      state.listenAnswered = !!state.lastListen.answered;
+      state.listenIndex = Math.min(saved.index || 0, state.listenQueue.length - 1);
+      state.listenAnswered = !!saved.answered;
       toast(`↩ 已恢复进度：从第 ${state.listenIndex + 1} 个继续`);
     } else {
       state.listenQueue = items;
@@ -2356,13 +3014,8 @@
     state.listenLastDecision = null;
     state.listenSource = scope;
     saveLastListen();
+    // v6：音频由 renderListenCard 里的 syncCardAudio 统一负责（出现即播、换词即停）
     renderListenCard();
-
-    // 自动播放第一题
-    setTimeout(() => {
-      const cur = state.listenQueue[state.listenIndex];
-      if (cur) Speech.speak(cur.word);
-    }, 220);
   }
 
   function renderListenCard() {
@@ -2372,6 +3025,7 @@
 
     // 顶部信息条
     if (state.listenQueue.length === 0) {
+      endCardAudio();
       if (info) info.innerHTML = `<span class="muted small">👆 选择单词本后点「开始听音」即可进入</span>`;
       area.innerHTML = `
         <div class="card flashcard" style="text-align:center;padding:48px 24px">
@@ -2385,6 +3039,7 @@
 
     const it = state.listenQueue[state.listenIndex];
     if (!it) {
+      endCardAudio();
       area.innerHTML = `
         <div class="card flashcard" style="text-align:center;padding:48px 24px">
           <div style="font-size:48px;margin-bottom:12px">🎉</div>
@@ -2394,7 +3049,7 @@
         </div>
       `;
       const restartBtn = $('#listenRestart');
-      if (restartBtn) restartBtn.onclick = () => { state.listenIndex = 0; state._listenKnowCount = 0; state._listenUnknowCount = 0; state.listenAnswered = false; renderListenCard(); setTimeout(()=>Speech.speak(state.listenQueue[0]?.word),220); };
+      if (restartBtn) restartBtn.onclick = () => { state.listenIndex = 0; state._listenKnowCount = 0; state._listenUnknowCount = 0; state.listenAnswered = false; renderListenCard(); };
       return;
     }
 
@@ -2475,7 +3130,10 @@
 
     // —— 事件绑定 ——
     const playBtn = $('#listenPlayBtn');
-    if (playBtn) playBtn.onclick = () => Speech.speak(it.word);
+    if (playBtn) playBtn.onclick = () => manualSpeak(it.word);
+
+    // v6：音频跟随词卡 —— 换一个词就停掉上一个、并自动朗读当前词
+    syncCardAudio(it.word);
 
     // 揭示后的重判
     const rejudge = $('#listenRejudgeUnknow');
@@ -2484,7 +3142,7 @@
         // 把这次"认识"撤销，改判为不认识：撤销计数并加入错词本
         state._listenKnowCount = Math.max(0, (state._listenKnowCount || 0) - 1);
         state._listenUnknowCount = (state._listenUnknowCount || 0) + 1;
-        addToWrongBook(it.word, it.type, it.sourceBookId);
+        addToWrongBook(it.word, it.type, it.sourceBookId, it.meaning);
         state.listenLastDecision = 'unknow';
         // 答错时 SRS 重置：下一题复习更短
         nextReviewAfter(it.srs, false);
@@ -2515,10 +3173,6 @@
           saveLastListen();
         }
         renderListenCard();
-        setTimeout(() => {
-          const cur2 = state.listenQueue[state.listenIndex];
-          if (cur2) Speech.speak(cur2.word);
-        }, 220);
       };
     }
   }
@@ -2535,7 +3189,7 @@
       nextReviewAfter(it.srs, true);
     } else {
       state._listenUnknowCount = (state._listenUnknowCount || 0) + 1;
-      addToWrongBook(it.word, it.type, it.sourceBookId);
+      addToWrongBook(it.word, it.type, it.sourceBookId, it.meaning);
       nextReviewAfter(it.srs, false);
     }
     saveLastListen();
@@ -2558,11 +3212,6 @@
     }
     saveLastListen();
     renderListenCard();
-    // 自动播放下一题
-    setTimeout(() => {
-      const it = state.listenQueue[state.listenIndex];
-      if (it) Speech.speak(it.word);
-    }, 220);
   }
 
   /* =====================================================
@@ -2690,6 +3339,7 @@
               <div class="meta">条目 ${g.items.length} 个 · 今日到期 ${g.items.filter(x => x.srs.nextReview <= Date.now() + DAY_MS).length}</div>
               <div class="row gap wrap" style="margin-top:6px">
                 <button class="btn small-btn" data-spell-now="${g.id === 'wrong' ? 'wrong' : ('book:' + g.id)}">✍ 拼写</button>
+                <button class="btn small-btn" data-listen-now="${g.id === 'wrong' ? 'wrong' : ('book:' + g.id)}">🔊 听音</button>
                 <button class="btn small-btn" data-go-study="${g.id === 'wrong' ? 'wrong' : g.id}">📖 背诵</button>
               </div>
             </div>
@@ -2736,11 +3386,12 @@
       btn.onclick = () => {
         const id = btn.dataset.goStudy;
         if (id === 'wrong') {
-          state.activeWrongSession = true;
-        } else {
-          state.activeBookId = id;
-          state.activeWrongSession = false;
+          // v5.9：错词复习跟随复习页当前过滤范围
+          startWrongSession(filter === 'all' ? 'all' : filter);
+          return;
         }
+        state.activeBookId = id;
+        state.activeWrongSession = false;
         saveLastStudy();
         $all('.tab').forEach(t => t.classList.remove('active'));
         $('.tab[data-tab="study"]').classList.add('active');
@@ -2748,6 +3399,9 @@
         $('#panel-study').classList.add('active');
         renderStudy();
       };
+    });
+    reviewArea.querySelectorAll('[data-listen-now]').forEach(btn => {
+      btn.onclick = () => startListenScope(btn.dataset.listenNow);
     });
     $('#reviewStartSpell').onclick = () => {
       // 按当前过滤拼写
@@ -2758,6 +3412,12 @@
       const scope = filter.startsWith('book:') ? filter : 'all';
       startSpellScope(scope);
     };
+    $('#reviewStartListen') && ($('#reviewStartListen').onclick = () => {
+      startListenScope(filter.startsWith('book:') ? filter : 'all');
+    });
+    $('#reviewStartWrong') && ($('#reviewStartWrong').onclick = () => {
+      startWrongSession(filter === 'all' ? 'all' : filter);
+    });
   }
 
   function bindSpell() {
@@ -3057,6 +3717,14 @@
     $('#editScopeHint').textContent = scope === 'dict'
       ? '将保存到字典，并应用到所有相关词本/错词本/文章'
       : '将更新当前单词本与错词本里的这条记录（不会写入字典）';
+    // v6：删除按钮 —— 字典范围删字典条目，词本范围删单词本 + 错词本里的这个词
+    const delBtn = $('#editDelete');
+    if (delBtn) {
+      delBtn.textContent = scope === 'dict' ? '🗑 从字典删除' : '🗑 删除这个词';
+      delBtn.title = scope === 'dict'
+        ? '从「我的字典」里删除这条'
+        : '把这个词从所有单词本和错词本里彻底删除（含学习进度）';
+    }
     $('#editModal').classList.remove('hidden');
     setTimeout(() => $('#editMeaning').focus(), 50);
   }
@@ -3139,10 +3807,90 @@
     else if (activePanel?.id === 'panel-notebooks') renderBooks();
   }
 
+  /** v6：把某个词从所有"学习进度"的队列里清掉（背诵 / 拼写 / 听音 / 各分片快照） */
+  function purgeWordFromProgress(wordKey) {
+    const same = (x) => x && window.VocabData.normalizeKey(x.word || x) === wordKey;
+    const clean = (arr) => (Array.isArray(arr) ? arr.filter(x => !same(x)) : arr);
+    state.studyQueue = clean(state.studyQueue);
+    state.spellQueue = clean(state.spellQueue);
+    state.listenQueue = clean(state.listenQueue);
+    [state.lastStudyMap, state.lastSpellMap, state.lastListenMap].forEach(map => {
+      Object.keys(map || {}).forEach(k => {
+        const snap = map[k];
+        if (snap && Array.isArray(snap.queue)) snap.queue = snap.queue.filter(q => !same(q));
+      });
+    });
+    if (state.studyStreak) delete state.studyStreak[wordKey];
+    if (state.studyIndex > state.studyQueue.length) state.studyIndex = state.studyQueue.length;
+    if (state.spellIndex > state.spellQueue.length) state.spellIndex = state.spellQueue.length;
+    if (state.listenIndex > state.listenQueue.length) state.listenIndex = state.listenQueue.length;
+  }
+
+  /** v6：删除当前编辑中的这个词 */
+  function deleteEditTarget() {
+    if (!editContext) return;
+    const ctx = editContext;
+    const raw = ($('#editWord').value || ctx.word || '').trim();
+    if (!raw) { toast('没有可删除的词'); return; }
+    const key = window.VocabData.normalizeKey(raw);
+
+    // 统计影响面，让用户确认
+    let bookHits = 0;
+    for (const b of state.books) {
+      bookHits += b.words.filter(w => window.VocabData.normalizeKey(w.word) === key).length;
+    }
+    const wrongHit = state.wrongBook.some(w => window.VocabData.normalizeKey(w.word) === key);
+    const dictHit = !!state.userDict[key];
+
+    let msg;
+    if (ctx.scope === 'dict') {
+      if (!dictHit) { toast('字典里没有这个词'); return; }
+      msg = `从「我的字典」删除「${raw}」？\n（单词本 / 错词本里已有的词不受影响）`;
+    } else {
+      if (!bookHits && !wrongHit) { toast('单词本与错词本里都没有这个词'); return; }
+      msg = `删除「${raw}」？\n\n将从 ${bookHits} 处单词本记录、错词本${wrongHit ? '（有）' : '（无）'}中移除，`
+        + `并清空它的学习进度，操作不可撤销。`;
+    }
+    if (!confirm(msg)) return;
+
+    if (ctx.scope === 'dict') {
+      delete state.userDict[key];
+      window.VocabData.setUserDict(state.userDict);
+      persist();
+      closeEditModal();
+      toast(`已从字典删除「${raw}」`);
+      renderDict();
+      return;
+    }
+
+    // 1) 单词本：删掉词条 + 清 mastered
+    for (const b of state.books) {
+      b.words = b.words.filter(w => window.VocabData.normalizeKey(w.word) !== key);
+      b.progress.mastered.delete(key);
+    }
+    // 2) 错词本
+    state.wrongBook = state.wrongBook.filter(w => window.VocabData.normalizeKey(w.word) !== key);
+    // 3) 学习进度队列 / 快照
+    purgeWordFromProgress(key);
+
+    persist();
+    closeEditModal();
+    toast(`已删除「${raw}」并清空它的学习进度`);
+
+    const activePanel = document.querySelector('.panel.active');
+    if (activePanel?.id === 'panel-study') renderStudy();
+    else if (activePanel?.id === 'panel-wrong') renderWrong();
+    else if (activePanel?.id === 'panel-dict') renderDict();
+    else if (activePanel?.id === 'panel-notebooks') renderBooks();
+    else if (activePanel?.id === 'panel-spell') renderSpellInit();
+    else if (activePanel?.id === 'panel-review') renderReview();
+  }
+
   function bindEditModal() {
     $('#editModalClose').addEventListener('click', closeEditModal);
     $('#editCancel').addEventListener('click', closeEditModal);
     $('#editSave').addEventListener('click', saveEdit);
+    $('#editDelete')?.addEventListener('click', deleteEditTarget);
     $('#editModal').addEventListener('click', (e) => {
       if (e.target.id === 'editModal') closeEditModal();
     });
@@ -3172,6 +3920,7 @@
     bindEditModal();
     bindArticle();
     bindGlobalSpeak();
+    bindAudioToggle();
     bindPrefs();
     updateParseHint();
     // 默认进背诵页，让用户能直接接着上次继续
@@ -3197,8 +3946,35 @@
       if (!btn) return;
       e.stopPropagation();
       e.preventDefault();
-      Speech.speak(btn.dataset.speak);
+      manualSpeak(btn.dataset.speak);
     });
+  }
+
+  /* ---------- 12.4 v6：顶部一键关闭 / 开启朗读音频 ---------- */
+  function bindAudioToggle() {
+    const btn = $('#audioToggle');
+    if (!btn) return;
+    const syncUI = () => {
+      Speech.setMuted(!!state.audioMuted);
+      btn.textContent = state.audioMuted ? '🔇' : '🔊';
+      btn.classList.toggle('off', !!state.audioMuted);
+      btn.title = state.audioMuted ? '朗读已关闭 · 点击开启' : '朗读已开启 · 点击关闭';
+    };
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.audioMuted = !state.audioMuted;
+      if (state.audioMuted) {
+        Speech.stop();
+        toast('🔇 朗读音频已关闭');
+      } else {
+        Speech.setMuted(false);
+        toast('🔊 朗读音频已开启');
+        try { Speech.speak('audio on'); } catch (err) {}
+      }
+      persist();
+      syncUI();
+    });
+    syncUI();
   }
 
   /* ---------- 12.5 用户偏好（自动朗读开关等） ---------- */
@@ -3216,6 +3992,7 @@
       // Ctrl/Cmd + Shift + S = 切换自动朗读
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 's') {
         state.autoSpeak = !state.autoSpeak;
+        if (!state.autoSpeak) Speech.stop();
         persist();
         toast(`🔊 自动朗读已${state.autoSpeak ? '开启' : '关闭'}`);
       }
@@ -3314,8 +4091,14 @@
       else if (s.status === 'error') {
         text.textContent = '同步失败';
         dot.className = 'sync-dot error';
-        // 显示具体错误（方便排查）
-        if (s.lastError) toast('✗ 同步失败：' + (s.lastError.length > 80 ? s.lastError.slice(0, 80) + '…' : s.lastError), 'error', 5000);
+        if (s.lastError) {
+          const shortErr = s.lastError.length > 80 ? s.lastError.slice(0, 80) + '…' : s.lastError;
+          toast('✗ 同步失败：' + shortErr, 'error', 5000);
+          // 会话过期时自动打开登录框
+          if (/登录已过期|JWT expired|token expired|unauthorized/i.test(s.lastError)) {
+            setTimeout(function () { showModal(); setMsg('登录已过期，请重新登录', 'error'); }, 600);
+          }
+        }
       }
       else if (s.status === 'idle' && s.lastSync) {
         const t = new Date(s.lastSync);
@@ -3342,10 +4125,19 @@
         state.autoSpeak = cloudData.prefs.autoSpeak !== false;
         state.wrongFilter = cloudData.prefs.wrongFilter || 'all';
         state.reviewFilter = cloudData.prefs.reviewFilter || 'all';
+        if (cloudData.prefs.activeBookId) state.activeBookId = cloudData.prefs.activeBookId;
+        if (cloudData.prefs.spellScope) state.spellScope = cloudData.prefs.spellScope;
+        if (cloudData.prefs.listenScope) state.listenScope = cloudData.prefs.listenScope;
+        if (cloudData.prefs.wrongSessionScope) state.wrongSessionScope = cloudData.prefs.wrongSessionScope;
+        if (cloudData.prefs.wrongCardMode) state.wrongCardMode = cloudData.prefs.wrongCardMode;
       }
-      state.lastStudy = cloudData.lastStudy || null;
-      state.lastSpell = cloudData.lastSpell || null;
-      state.lastListen = cloudData.lastListen || null;
+      state.lastStudy = stripMap(cloudData.lastStudy);
+      state.lastSpell = stripMap(cloudData.lastSpell);
+      state.lastListen = stripMap(cloudData.lastListen);
+      // v5.9：按单词本分片的进度 map（本地已有的分片优先，避免覆盖进行中的进度）
+      mergeProgressMap(state.lastStudyMap, readMap(cloudData.lastStudy));
+      mergeProgressMap(state.lastSpellMap, readMap(cloudData.lastSpell));
+      mergeProgressMap(state.lastListenMap, readMap(cloudData.lastListen));
       persist();
     }
 
