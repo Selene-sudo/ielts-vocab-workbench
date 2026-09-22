@@ -12,6 +12,10 @@ on:
       password:
         description: 'Supabase login password'
         required: true
+      fix_missing_meaning:
+        description: '回填缺释义的错词（true=执行写入）'
+        required: false
+        default: 'false'
 
 jobs:
   audit:
@@ -25,9 +29,10 @@ jobs:
           SB_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           SB_EMAIL: ${{ github.event.inputs.email }}
           SB_PASS: ${{ github.event.inputs.password }}
+          SB_FIX: ${{ github.event.inputs.fix_missing_meaning }}
         run: |
           python3 - <<'PYCODE'
-          import json, os, urllib.request, urllib.error, time
+          import json, os, urllib.request, urllib.error, urllib.parse, time
 
           URL = os.environ['SB_URL'].rstrip('/')
           KEY = os.environ['SB_KEY']
@@ -167,6 +172,33 @@ jobs:
               p('WRONG_FIXABLE', len(fixable))
               p('WRONG_UNFIXABLE', len(still))
               p('WRONG_UNFIXABLE_SAMPLE', ','.join([w.get('word', '') for w in still[:15]]))
+
+              # ---------- 6c. 回填缺失释义（仅当 fix_missing_meaning=true） ----------
+              FIX = os.environ.get('SB_FIX', 'false').strip().lower() == 'true'
+              p('FIX_FLAG', FIX)
+              if FIX and fixable:
+                  ok, fail = 0, 0
+                  for w in fixable:
+                      word = w.get('word') or ''
+                      if not word:
+                          continue
+                      path = ('/rest/v1/wrong_book?user_id=eq.%s&word=eq.%s'
+                              % (SUID, urllib.parse.quote(word, safe='')))
+                      code, hh, bb = http('PATCH', path,
+                                          dict(AUTH, **{'Content-Type': 'application/json',
+                                                        'Prefer': 'return=minimal'}),
+                                          json.dumps({'meaning': meaning_by_word[word]}).encode())
+                      if code in (200, 204, 201):
+                          ok += 1
+                      else:
+                          fail += 1
+                          if fail <= 3:
+                              p('FIX_FAIL', '%s http=%s %s' % (word, code, (bb or b'')[:80]))
+                  p('FIX_RESULT', 'updated=%d failed=%d' % (ok, fail))
+                  st2, leftRaw = rows_get('wrong_book', 'user_id=eq.%s&select=word,meaning&limit=500' % SUID)
+                  if isinstance(leftRaw, list):
+                      still_bad = sum(1 for w in leftRaw if not (w.get('meaning') or '').strip())
+                      p('WRONG_NO_MEANING_AFTER', still_bad)
 
           # ---------- 7. 用户词典 ----------
           st, ud = rows_get('user_dict', 'user_id=eq.%s&select=word,entry&limit=5' % SUID)
