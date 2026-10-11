@@ -1,14 +1,27 @@
-# GitHub Actions: 定时 ping Supabase 防 7 天休眠
-# - 每 3 天 UTC 9:00 跑一次（北京时间 17:00）
-# - 也支持手动触发（Actions → Keep Supabase Alive → Run workflow）
-# - 双保险：先调一次 REST API 读，再调一次 RPC 写（确保产生 DB activity）
+# GitHub Actions: 定时 ping Supabase 防休眠
+#
+# ⚠️ 为什么从「每 3 天一次」改成「每 6 小时一次」：
+# Supabase 免费版判定暂停的门槛不是「7 天内有 1 次活动」，而是
+# 「过去一周内有足够多的用户数据库活动」。官方 Project Pausing 文档原话：
+#   "Typically a few user requests to the database each day over the
+#    previous week is enough to keep the project from being paused."
+# 旧配置每 3 天跑 1 次 = 一周只有 2~3 个请求，达不到「每天几个请求」的门槛，
+# 项目因此被判定活跃度不足 → 2026-10-01 被自动暂停（域名解析变为 NXDOMAIN）。
+#
+# 另外：GitHub 会在仓库 60 天无活动后自动停用所有 scheduled workflow，
+# 而保活任务「自己死了」是没有告警的。所以本文件在失败时自动开 Issue（@ 提醒仓库所有者），
+# 成功后自动关闭遗留的告警 Issue。
 name: Keep Supabase Alive
 
 on:
   schedule:
-    # 每 3 天的 9:00 UTC（北京时间 17:00）
-    - cron: '0 9 */3 * *'
-  workflow_dispatch:  # 手动触发
+    # 每 6 小时一次：UTC 0/6/12/18 点 = 北京时间 8:00 / 14:00 / 20:00 / 次日 2:00
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # 手动触发（Actions → Keep Supabase Alive → Run workflow）
+
+permissions:
+  contents: read
+  issues: write # 失败时自动开 Issue 告警需要
 
 jobs:
   ping:
@@ -27,6 +40,11 @@ jobs:
             -H "Authorization: Bearer ${SUPABASE_ANON_KEY}")
           echo "← HTTP $HTTP"
           cat /tmp/resp.json
+          echo
+          if [ "$HTTP" = "540" ]; then
+            echo "❌ 项目处于 Paused（HTTP 540）→ 去 https://supabase.com/dashboard/projects 点 Resume project"
+            exit 1
+          fi
           if [ "$HTTP" != "200" ]; then
             echo "❌ Ping failed (HTTP $HTTP)"
             exit 1
@@ -47,8 +65,60 @@ jobs:
             -d '{}')
           echo "← HTTP $HTTP"
           cat /tmp/resp.json
+          echo
           if [ "$HTTP" != "200" ]; then
-            echo "⚠️  RPC failed (HTTP $HTTP)，但项目应该已经被上一步唤醒"
+            echo "❌ RPC failed (HTTP $HTTP) —— 写入类活动没产生，仅靠上一步的读可能不够"
+            exit 1
+          fi
+          echo "✅ Supabase keep_alive RPC succeeded"
+
+      - name: 失败时打印诊断信息（DNS / 连通性）
+        if: failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        run: |
+          HOST=$(echo "$SUPABASE_URL" | sed -E 's#^https?://##; s#/.*$##')
+          echo "被探测的主机：$HOST"
+          echo "--- DNS 解析 ---"
+          getent hosts "$HOST" || echo "⚠️ DNS 解析失败（项目很可能已被暂停：暂停后域名不再提供解析）"
+          echo "--- 连通性 ---"
+          curl -sS -m 10 "https://$HOST/rest/v1/" >/dev/null && echo "连通正常" || echo "curl 失败（退出码 6 = DNS 解析失败）"
+
+      - name: 失败告警：自动开 Issue（@ 提醒仓库所有者）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ⚠️ Supabase 保活失败：云端同步可能已中断
+        run: |
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues"
+          OPEN_COUNT=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" "${API}?state=open&per_page=100" \
+            | jq -r --arg t "$TITLE" '[.[] | select(.title == $t)] | length')
+          if [ "$OPEN_COUNT" != "0" ]; then
+            echo "已有开启中的告警 Issue，跳过创建（避免每 6 小时刷一个）"
+            exit 0
+          fi
+          echo "创建告警 Issue…"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}" --data-binary @- <<JSON
+          {"title":"${TITLE}","body":"@Selene-sudo 保活任务刚刚失败，**云端同步很可能已经断了**，请尽快处理。\n\n- 失败运行记录：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\n\n**处理步骤**\n\n1. 打开 https://supabase.com/dashboard/projects ，看项目是否显示 **Paused**\n2. 如果被暂停：选中项目 → 点 **Resume project** → 确认，等 1~2 分钟\n3. 恢复后回本仓库 Actions 页，手动跑一次 Keep Supabase Alive 确认变绿\n4. 保活恢复正常后，本 Issue 会被自动关闭\n\n**不用担心数据**：暂停期间数据不会丢（免费版有 1 年恢复窗口），而且你浏览器本地的学习数据始终完整可用。"}
+          JSON
+
+      - name: 恢复正常时自动关闭遗留的告警 Issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ⚠️ Supabase 保活失败：云端同步可能已中断
+        run: |
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues"
+          NUM=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" "${API}?state=open&per_page=100" \
+            | jq -r --arg t "$TITLE" '.[] | select(.title == $t) | .number' | head -1)
+          if [ -n "$NUM" ]; then
+            curl -sS -X PATCH -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}/${NUM}" -d '{"state":"closed"}' >/dev/null
+            echo "✅ 保活已恢复，自动关闭告警 Issue #${NUM}"
           else
-            echo "✅ Supabase keep_alive RPC succeeded"
+            echo "没有需要关闭的告警 Issue"
           fi
