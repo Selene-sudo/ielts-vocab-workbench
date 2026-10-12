@@ -252,8 +252,16 @@
       words = book.words.slice();
       if (!words.length) { toast('这本还没有词条'); return; }
       lines.push(`· 《${book.name}》全 ${words.length} 个词的「已掌握」标记清空，全部重新进入拼写`);
-    } else if (scope === 'wrong') {
-      words = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+    } else if (scope.startsWith('wrong:')) {
+      // wrong（全部）/ wrong:book:<id>（某词本错词）/ wrong:orphans（未归类错词）
+      let wrongList = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+      if (scope.startsWith('wrong:book:')) {
+        const id = scope.slice('wrong:book:'.length);
+        wrongList = wrongList.filter(w => w.sources && w.sources.includes(id));
+      } else if (scope === 'wrong:orphans') {
+        wrongList = wrongList.filter(w => !w.sources || !w.sources.length);
+      }
+      words = wrongList;
       if (!words.length) { toast('错词本里没有待复习的词'); return; }
       lines.push(`· ${words.length} 个错词的「已答对次数」清零，复习阶梯回到第 1 天`);
     } else {
@@ -267,7 +275,7 @@
     if (!confirm(`重置「${label}」的拼写进度？\n\n${lines.join('\n')}\n\n（错词本里的错词不会被删除）`)) return;
     clearPassKeys('spell', passKeysOf(words));
     if (book) book.progress.mastered = new Set();
-    if (scope === 'wrong') resetWrongProgress(words);
+    if (scope.startsWith('wrong:')) resetWrongProgress(words);
     delete state.lastSpellMap[scope];
     state.lastSpell = null;
     state.spellQueue = [];
@@ -1653,7 +1661,13 @@
       state._wrongQueueScope = null;
       renderStudy();
     });
-    $('#spellWrongHere')?.addEventListener('click', () => startSpellScope(scope === 'all' ? 'wrong' : scope));
+    $('#spellWrongHere')?.addEventListener('click', () => {
+      // 当前错词范围 → 进入「只拼这批错词」的拼写：all→wrong，book:<id>→wrong:book:<id>，orphans→wrong:orphans
+      const target = scope === 'all' ? 'wrong'
+        : scope === 'orphans' ? 'wrong:orphans'
+        : ('wrong:' + scope);
+      startSpellScope(target);
+    });
 
     // v6.3：进度条旁的重置按钮（重置本范围的错词复习进度）
     const _resetInlineWrong = $('#studyResetInline');
@@ -2507,10 +2521,17 @@
           });
         }
       }
-    } else if (scope === 'wrong') {
+    } else if (scope === 'wrong' || scope.startsWith('wrong:')) {
+      // 错词本：wrong = 全部未毕业错词；wrong:book:<id> = 某词本的错词；wrong:orphans = 未归类错词
       for (const w of state.wrongBook) {
         if ((w.correctCount || 0) >= 3) continue;
         if (!w.srs) w.srs = newSrsRecord();
+        if (scope.startsWith('wrong:book:')) {
+          const id = scope.slice('wrong:book:'.length);
+          if (!w.sources || !w.sources.includes(id)) continue;
+        } else if (scope === 'wrong:orphans') {
+          if (w.sources && w.sources.length) continue;
+        }
         pushItem(w.word, w.type, { srs: w.srs, sourceBookId: null, wrong: w, meaning: w.meaning });
       }
     } else if (scope.startsWith('book:')) {
@@ -2543,6 +2564,11 @@
     if (scope === 'due') return '今日到期（SRS）';
     if (scope === 'wrong') return '错词本（未毕业）';
     if (scope === 'all') return '全部条目';
+    if (scope.startsWith('wrong:book:')) {
+      const b = state.books.find(x => x.id === scope.slice('wrong:book:'.length));
+      return b ? `《${b.name}》的错词` : '（词本已删除）';
+    }
+    if (scope === 'wrong:orphans') return '未归类错词';
     if (scope.startsWith('book:')) {
       const b = state.books.find(x => x.id === scope.slice(5));
       return b ? `《${b.name}》` : '（词本已删除）';
@@ -2650,6 +2676,20 @@
     const opts = ['<option value="due">今日到期（SRS）</option>',
       '<option value="wrong">错词本（未毕业）</option>',
       '<option value="all">全部条目</option>'];
+    // 按词本筛选错词：每个词本一列「《书名》的错词 (N)」
+    const wrongByBook = state.books
+      .map(b => {
+        const n = state.wrongBook.filter(w => (w.correctCount || 0) < 3 && w.sources && w.sources.includes(b.id)).length;
+        return `<option value="wrong:book:${b.id}">《${escapeHtml(b.name)}》的错词 (${n})</option>`;
+      })
+      .join('');
+    if (wrongByBook) {
+      opts.push(`<optgroup label="错词本（按词本）">${wrongByBook}</optgroup>`);
+    }
+    const orphans = state.wrongBook.filter(w => (w.correctCount || 0) < 3 && (!w.sources || !w.sources.length)).length;
+    if (orphans) {
+      opts.push(`<option value="wrong:orphans">未归类错词 (${orphans})</option>`);
+    }
     for (const b of state.books) {
       opts.push(`<option value="book:${b.id}">《${escapeHtml(b.name)}》</option>`);
     }
