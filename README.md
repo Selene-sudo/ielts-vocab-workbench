@@ -50,6 +50,14 @@ v6.7 做了一次完整的视觉重做，目标是让工具"拿得出手"——�
 
 无障碍与工程细节：键盘焦点可见、`prefers-reduced-motion` 降级、移动端标签横向滚动、无横向溢出。
 
+## 线上地址（当前生效）
+
+**https://ielts-vocab-workbench-97952.app.workbuddy.host/**
+
+> 旧地址 `https://29434aabec424d5f960282f5c0ffa5a2.app.workbuddy.link/` 已无法从本工作区更新，代码停留在旧版本，请勿再使用。
+
+云端数据托管在同一个 Supabase 项目（ref `fheznzjgwxyqtpdezwny`），页面内「云同步」登录后可在多设备同步单词本、错词本与学习进度。
+
 ## 技术栈
 
 - **前端**：原生 HTML / CSS / JavaScript（ES2020），无框架、无打包器、无依赖
