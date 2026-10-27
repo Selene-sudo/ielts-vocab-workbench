@@ -1,0 +1,207 @@
+# Supabase 数据同步体检（一次性）
+# 触发方式：Actions → Supabase Sync Audit → Run workflow（输入邮箱与密码）
+# 凭据仅通过 workflow_dispatch 入参传入，不写入仓库
+name: Supabase Sync Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: 'Supabase login email'
+        required: true
+      password:
+        description: 'Supabase login password'
+        required: true
+      fix_missing_meaning:
+        description: '回填缺释义的错词（true=执行写入）'
+        required: false
+        default: 'false'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Audit cloud data
+        shell: bash
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SB_EMAIL: ${{ github.event.inputs.email }}
+          SB_PASS: ${{ github.event.inputs.password }}
+          SB_FIX: ${{ github.event.inputs.fix_missing_meaning }}
+        run: |
+          python3 - <<'PYCODE'
+          import json, os, urllib.request, urllib.error, urllib.parse, time
+
+          URL = os.environ['SB_URL'].rstrip('/')
+          KEY = os.environ['SB_KEY']
+          EMAIL = os.environ['SB_EMAIL']
+          PASS = os.environ['SB_PASS']
+
+          def p(tag, s):
+              print('@@%s\t%s' % (tag, s), flush=True)
+
+          def http(method, path, headers=None, body=None, timeout=60):
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request(URL + path, method=method, data=body)
+                      req.add_header('apikey', KEY)
+                      for k, v in (headers or {}).items():
+                          req.add_header(k, v)
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          return r.status, dict(r.headers), r.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code >= 500 and attempt < 3:
+                          time.sleep(2); continue
+                      return e.code, dict(e.headers or {}), e.read()
+                  except Exception as e:
+                      if attempt < 3:
+                          time.sleep(2); continue
+                      return -1, {}, str(e).encode()
+              return -1, {}, b''
+
+          # ---------- 1. 登录 ----------
+          st, hd, bd = http('POST', '/auth/v1/token?grant_type=password',
+                            {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + KEY},
+                            json.dumps({'email': EMAIL, 'password': PASS}).encode())
+          try:
+              login = json.loads(bd or b'{}')
+          except Exception:
+              login = {}
+          TOK = login.get('access_token') or ''
+          SUID = (login.get('user') or {}).get('id') or ''
+          if not TOK:
+              p('LOGIN_FAILED', (bd or b'')[:200])
+              raise SystemExit(1)
+          p('USER_ID', SUID)
+          AUTH = {'Authorization': 'Bearer ' + TOK}
+
+          def rows_count(table, qs):
+              st, hd, bd = http('GET', '/rest/v1/%s?%s' % (table, qs),
+                                dict(AUTH, **{'Prefer': 'count=exact', 'Range': '0-0'}))
+              cr = hd.get('Content-Range') or hd.get('content-range') or ''
+              total = cr.split('/')[-1] if '/' in cr else '?'
+              return st, total, bd
+
+          def rows_get(table, qs):
+              st, hd, bd = http('GET', '/rest/v1/%s?%s' % (table, qs), AUTH)
+              try:
+                  return st, json.loads(bd or b'[]')
+              except Exception:
+                  return st, (bd or b'')[:200]
+
+          # ---------- 2. 各表行数 ----------
+          for t, key in [('vocab_books', 'user_id'), ('wrong_book', 'word'),
+                         ('user_dict', 'word'), ('user_state', 'user_id')]:
+              st, total, bd = rows_count(t, 'user_id=eq.%s&select=%s' % (SUID, key))
+              p('COUNT', '%s=%s (http=%s)' % (t, total, st))
+
+          # ---------- 3. 单词本 + 每本书单词数 ----------
+          st, books = rows_get('vocab_books',
+                               'user_id=eq.%s&select=id,name,source,created_at&order=created_at' % SUID)
+          if isinstance(books, list):
+              total_words = 0
+              for b in books:
+                  stt, n, _b = rows_count('vocab_words', 'book_id=eq.%s&select=word' % b['id'])
+                  try:
+                      total_words += int(n)
+                  except Exception:
+                      pass
+                  p('BOOK', '%s\t%s\twords=%s\tcreated=%s' % (
+                      b.get('name', ''), b.get('id', ''), n, (b.get('created_at') or '')[:10]))
+              p('COUNT', 'vocab_words(合计)=%d' % total_words)
+
+              # ---------- 4. 单词抽样 ----------
+              for b in books[:4]:
+                  st, rows = rows_get('vocab_words',
+                                      'book_id=eq.%s&select=word,type,meaning,mastered&limit=3' % b['id'])
+                  sample = json.dumps(rows, ensure_ascii=False)[:260] if isinstance(rows, list) else rows
+                  p('WORDS_SAMPLE', '%s -> %s' % (b.get('name', ''), sample))
+
+          # ---------- 5. 错词 ----------
+          st, wrong = rows_get('wrong_book',
+                               'user_id=eq.%s&select=word,meaning,correct_count,last_seen&limit=500' % SUID)
+          if isinstance(wrong, list):
+              p('WRONG_COUNT', len(wrong))
+              bad = sum(1 for w in wrong if not (w.get('meaning') or '').strip())
+              p('WRONG_NO_MEANING', bad)
+              for w in wrong[:6]:
+                  p('WRONG', '%s | %s | correct=%s' % (
+                      w.get('word'), (w.get('meaning') or '(空)')[:24], w.get('correct_count')))
+
+          # ---------- 6. user_state ----------
+          st, state = rows_get('user_state', 'user_id=eq.%s&select=*' % SUID)
+          if isinstance(state, list) and state:
+              r = state[0]
+              p('STATE_KEYS', ','.join(r.keys()))
+              for k, v in r.items():
+                  if k == 'user_id' or v is None:
+                      continue
+                  s = json.dumps(v, ensure_ascii=False)
+                  p('STATE_SIZE', '%s\t%d chars' % (k, len(s)))
+                  if k in ('last_study', 'last_spell', 'last_listen') and isinstance(v, dict):
+                      m = v.get('__map') or {}
+                      p('STATE_%s_MAPKEYS' % k, ','.join(list(m.keys())[:30]) if isinstance(m, dict) else str(m)[:60])
+                      for mk, mv in list(m.items())[:30]:
+                          try:
+                              sub = (mv or {}).get('queue') or []
+                              p('STATE_MAPITEM', '%s\t%s\tidx=%s\tqueue=%d' % (
+                                  k.replace('last_', ''), mk, (mv or {}).get('index'), len(sub)))
+                          except Exception:
+                              pass
+                  if k == 'prefs':
+                      p('STATE_PREFS', s[:160])
+              p('STATE_UPDATED_AT', r.get('updated_at', '?'))
+          else:
+              p('STATE', 'none or %s' % state)
+
+          # ---------- 6b. 缺释义的错词能否从单词本补回 ----------
+          st, all_words = rows_get('vocab_words',
+                                   'book_id=in.(%s)&select=book_id,word,meaning&limit=2000'
+                                   % ','.join([b['id'] for b in books]) if isinstance(books, list) else '')
+          meaning_by_word = {}
+          if isinstance(all_words, list):
+              for w in all_words:
+                  if w.get('word') and (w.get('meaning') or '').strip():
+                      meaning_by_word.setdefault(w['word'], w['meaning'])
+          p('WORDS_WITH_MEANING_INDEX', len(meaning_by_word))
+          if isinstance(wrong, list):
+              fixable = [w for w in wrong if not (w.get('meaning') or '').strip() and meaning_by_word.get(w.get('word'))]
+              still = [w for w in wrong if not (w.get('meaning') or '').strip() and not meaning_by_word.get(w.get('word'))]
+              p('WRONG_FIXABLE', len(fixable))
+              p('WRONG_UNFIXABLE', len(still))
+              p('WRONG_UNFIXABLE_SAMPLE', ','.join([w.get('word', '') for w in still[:15]]))
+
+              # ---------- 6c. 回填缺失释义（仅当 fix_missing_meaning=true） ----------
+              FIX = os.environ.get('SB_FIX', 'false').strip().lower() == 'true'
+              p('FIX_FLAG', FIX)
+              if FIX and fixable:
+                  ok, fail = 0, 0
+                  for w in fixable:
+                      word = w.get('word') or ''
+                      if not word:
+                          continue
+                      path = ('/rest/v1/wrong_book?user_id=eq.%s&word=eq.%s'
+                              % (SUID, urllib.parse.quote(word, safe='')))
+                      code, hh, bb = http('PATCH', path,
+                                          dict(AUTH, **{'Content-Type': 'application/json',
+                                                        'Prefer': 'return=minimal'}),
+                                          json.dumps({'meaning': meaning_by_word[word]}).encode())
+                      if code in (200, 204, 201):
+                          ok += 1
+                      else:
+                          fail += 1
+                          if fail <= 3:
+                              p('FIX_FAIL', '%s http=%s %s' % (word, code, (bb or b'')[:80]))
+                  p('FIX_RESULT', 'updated=%d failed=%d' % (ok, fail))
+                  st2, leftRaw = rows_get('wrong_book', 'user_id=eq.%s&select=word,meaning&limit=500' % SUID)
+                  if isinstance(leftRaw, list):
+                      still_bad = sum(1 for w in leftRaw if not (w.get('meaning') or '').strip())
+                      p('WRONG_NO_MEANING_AFTER', still_bad)
+
+          # ---------- 7. 用户词典 ----------
+          st, ud = rows_get('user_dict', 'user_id=eq.%s&select=word,entry&limit=5' % SUID)
+          p('USER_DICT', json.dumps(ud, ensure_ascii=False)[:220] if isinstance(ud, list) else ud)
+          print('@@DONE', flush=True)
+          PYCODE

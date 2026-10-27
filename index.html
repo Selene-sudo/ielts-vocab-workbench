@@ -4,7 +4,16 @@
   <meta charset="UTF-8" data-page-node-id="waIDoYnGCb2iFEBQxJic6c" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="U0EwChTT9dJFUovYEe6NOg" />
   <title>雅思词汇工作台 · VocabMaster</title>
-  <link rel="stylesheet" href="styles.css" data-page-node-id="uxAwwmawcJrJgnd1Zyc4X1" />
+  <meta name="description" content="VocabMaster 雅思词汇工作台：导入词汇即可背诵、听音辨义、拼写与错词复习，按艾宾浩斯曲线自动排程。原生 HTML / CSS / JavaScript 构建，学习数据保存在本地浏览器。" />
+  <meta name="author" content="Selene" />
+  <meta name="theme-color" content="#0f5a52" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="雅思词汇工作台 · VocabMaster" />
+  <meta property="og:description" content="导入→背诵→错词闭环→文章巩固。支持听音辨义、拼写训练、艾宾浩斯复习与云端同步的雅思词汇学习工作台。" />
+  <meta property="og:site_name" content="VocabMaster" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230f5a52'/%3E%3Ctext x='32' y='43' font-family='Georgia,serif' font-size='30' font-weight='700' fill='%23f4f1e9' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css?v=6.8" data-page-node-id="uxAwwmawcJrJgnd1Zyc4X1" />
 </head>
 <body data-page-node-id="DLlBgq9Eh76QuExUifuECW">
   <div id="app" data-page-node-id="mMAB3AbdKZM0KBSVUMLEXT">
@@ -40,6 +49,7 @@
     </header>
 
     <main class="main" data-page-node-id="bmMU1Np2jGGbNOotuUzQBD">
+      <div id="audioMuteBanner" class="mute-banner" style="display:none">🔇 朗读音频已关闭 · 点右上角 🔊 重新开启</div>
       <!-- 首页：导入 -->
       <section class="panel active" id="panel-home" data-page-node-id="0RnvNCOvRERFX2wgS5YPau">
         <div class="hero" data-page-node-id="mGIpN70BRaAG5RI9qFdG47">
@@ -88,7 +98,7 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
           </div>
           <div class="row gap" data-page-node-id="OxKJxniVDbDtSD1b0b9tlL">
             <select id="studyBookSelect" class="select" data-page-node-id="INkAByxzPc10yPIcERmFO1"></select>
-            <button class="btn ghost" id="restartBook" data-page-node-id="8hL1BuPf6JOGIik1Zx1rW4">重置进度</button>
+            <button class="btn ghost danger" id="restartBook" title="清空这本的已掌握标记与连续计数，从头再背一遍" data-page-node-id="8hL1BuPf6JOGIik1Zx1rW4">🔄 重置进度</button>
           </div>
         </div>
 
@@ -105,10 +115,11 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
           <div class="row gap wrap" data-page-node-id="icnvT7hX3pcJYb4uCYYV82">
             <select id="spellScopeSelect" class="select" style="min-width:180px" data-page-node-id="icnvT7hX3pcJYb4uCYYV83"></select>
             <button class="btn ghost" id="spellRefresh" data-page-node-id="icnvT7hX3pcJYb4uCYYV84">重新生成队列</button>
+            <button class="btn ghost danger" id="spellReset" type="button" title="清空当前范围的拼写进度（含连续拼对计数），队列重建，从头再拼">🔄 重置进度</button>
           </div>
         </div>
 
-        <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <div class="card toolbar-card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <span class="muted small">快捷进入：</span>
           <button class="btn small-btn" data-spell-scope="due" id="spellShortcutDue">📅 今日到期（SRS）</button>
           <button class="btn small-btn" data-spell-scope="wrong" id="spellShortcutWrong">🔥 错词本</button>
@@ -131,11 +142,12 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
           </div>
         </div>
 
-        <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <div class="card toolbar-card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <span class="muted small">选择单词本：</span>
           <select id="listenBookPicker" class="select" style="min-width:160px"></select>
           <button class="btn primary small-btn" id="listenBookGo">🔊 开始听音</button>
           <button class="btn ghost small-btn" id="listenRepeat" title="再播一次当前词的发音">🔁 再听一次</button>
+          <button class="btn ghost danger small-btn" id="listenReset" type="button" title="清空当前范围的听音进度（含连续认识计数），队列重建，从头再听">🔄 重置进度</button>
         </div>
 
         <div id="listenInfoBar" class="card" style="padding:10px 16px" data-page-node-id="icnvT7hX3pcJYb4uCYYV76"></div>
@@ -167,6 +179,32 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
           <button class="btn ghost" id="exportAll" data-page-node-id="QUNc6MdP0HXHHRNKGFlywV">导出全部（JSON）</button>
           <button class="btn ghost" id="importAll" data-page-node-id="icnvT7hX3pcJYb4uCYYV90" title="从之前导出的 JSON 备份恢复（合并或替换）">📥 导入 JSON 备份</button>
           <input type="file" id="importAllFile" accept="application/json,.json" style="display:none" data-page-node-id="icnvT7hX3pcJYb4uCYYV91" />
+        </div>
+        <div class="card" style="margin-top:14px">
+          <div class="row between wrap gap">
+            <div>
+              <h3 style="margin:0 0 4px">💾 本地文件夹自动备份</h3>
+              <p class="muted small" style="margin:0">把学习进度数据覆盖写入你 Mac 上的本地文件夹（推荐选 <b>~/Documents/雅思词汇备份</b>）。在 Chrome / Edge 里选定后，每次打开应用或切到后台都会自动存一份 <code>vocab-data.json</code>，与每周的项目代码备份落在同一目录。</p>
+            </div>
+            <div class="row gap wrap" style="align-items:center">
+              <button class="btn ghost" id="pickBackupDir">📁 选择本地备份文件夹</button>
+              <button class="btn ghost" id="backupNow">💾 立即备份数据</button>
+            </div>
+          </div>
+          <p id="backupStatus" class="muted small" style="margin:10px 0 0"></p>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <div class="row between wrap gap">
+            <div>
+              <h3 style="margin:0 0 4px">🔊 音频诊断 / 测试</h3>
+              <p class="muted small" style="margin:0">朗读没声音时：先点「测试朗读」看引擎是否出声；若仍无声，点「强制重置语音引擎」可解除 Chrome 常见的"卡死"状态；再不行就重启浏览器或检查系统/标签页是否被静音。下方实时显示当前音频状态。</p>
+            </div>
+            <div class="row gap wrap" style="align-items:center">
+              <button class="btn ghost" id="audioTestBtn">🔊 测试朗读</button>
+              <button class="btn ghost" id="audioResetBtn">♻ 强制重置语音引擎</button>
+            </div>
+          </div>
+          <div id="audioDiag" class="muted small" style="margin:10px 0 0;white-space:pre-line;line-height:1.7"></div>
         </div>
         <div id="bookList" class="grid" data-page-node-id="6UfXzcPXaE1l7kTesNzkRM"></div>
       </section>
@@ -281,6 +319,15 @@ apply | v. 申请,应用
       </section>
     </main>
 
+    <!-- 页脚 -->
+    <footer class="app-foot">
+      <span class="foot-name">VocabMaster · 雅思词汇工作台</span>
+      <span class="dot">·</span>
+      <span>原生 HTML / CSS / JavaScript</span>
+      <span class="dot">·</span>
+      <span>数据存于本地浏览器</span>
+    </footer>
+
     <!-- 编辑释义弹窗 -->
     <div id="editModal" class="modal hidden" data-page-node-id="Lgwox25quXZaeomWZ1pg1w">
       <div class="modal-card" data-page-node-id="XCwvW3w5xqPN9eUmiPjnVd">
@@ -349,9 +396,9 @@ apply | v. 申请,应用
     </div>
   </div>
 
-  <script src="data.js"></script>
-  <script src="supabase.js"></script>
-  <script src="sync.js"></script>
-  <script src="app.js"></script>
+  <script src="data.js?v=6.8"></script>
+  <script src="supabase.js?v=6.8"></script>
+  <script src="sync.js?v=6.8"></script>
+  <script src="app.js?v=6.8"></script>
 </body>
 </html>

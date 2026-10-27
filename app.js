@@ -17,7 +17,7 @@
     studyIndex: 0,
     studyQueue: [],     // 当前背诵队列（v6：可能含重复项 —— 未通过的词会重新排入队尾）
     studyRevealed: false,
-    studyStreak: {},    // v6：{ word: 连续「认识」次数 }，达到 STUDY_PASS_STREAK 才通过
+    studyPass: {},      // v6.2：{ word: { s: 已连续答对, n: 本次要求 } } —— 答错后需连续答对 2 次
     audioMuted: false,  // v6：全局朗读总开关（顶部 🔊 按钮）
     dictFilter: 'all',  // all | word | phrase
     editScope: 'dict',
@@ -27,6 +27,7 @@
     spellIndex: 0,
     spellAnswered: false,
     spellSource: '',    // 用于显示当前拼写模式
+    spellPass: {},      // v6.2：拼写通过规则记录（答错后需连续拼对 2 次）
     // —— v5：进度恢复 ——
     lastStudy: null,    // { activeBookId, activeWrongSession, studyIndex, studyQueue, studyRevealed }
     lastSpell: null,    // { scope, queue, index, answered }
@@ -47,6 +48,7 @@
     listenAnswered: false,
     listenLastDecision: null,  // 'know' | 'unknow' | null  上一次的选择
     listenSource: '',    // 用于显示来源
+    listenPass: {},      // v6.2：听音通过规则记录（答错后需连续认识 2 次）
     // —— v5：自动朗读开关 ——
     autoSpeak: true,
     // —— v5：错词 / 复习 tab 的过滤 ——
@@ -59,11 +61,279 @@
   const SRS_INTERVALS = [1, 2, 4, 7, 15, 30];
   const DAY_MS = 24 * 60 * 60 * 1000;
 
-  /* ---------- 0.6 v6：背诵词卡通过规则 ---------- */
-  // 每个词需要「连续认识」STUDY_PASS_STREAK 次才算通过；
-  // 期间任何一次「不认识」都会把计数清零、立即进错词本，并把词卡重新排回队尾
-  // —— 也就是点一次不认识后，这张卡至少还要再出现两次、连续答对两次才能过。
-  const STUDY_PASS_STREAK = 2;
+  /* ---------- 0.6 v6.2：三模式统一的「通过规则」（背诵 / 拼写 / 听音共用） ---------- */
+  // 规则：
+  //   · 第一次就答对        → 立即通过，不再重复出现，也不进错词本
+  //   · 只要答错一次        → 立即进错词本，计数清零，词卡重新排回队尾；
+  //                          之后必须「连续答对 2 次」才算通过
+  //                          （也就是这张卡还会至少再出现两次，两次都要答对；
+  //                            中途再答错则重新数，依然是连续两次）
+  const PASS_STREAK_DEFAULT = 1;     // 一遍就答对 → 直接通过
+  const PASS_STREAK_AFTER_MISS = 2;  // 答错之后 → 需连续答对 2 次
+
+  /**
+   * 通过规则状态机（背 / 拼 / 听 三种模式共用，互不干扰）
+   * state.studyPass / state.spellPass / state.listenPass 结构：
+   *   { [wordKey]: { s: 已连续答对次数, n: 本次要求的连续答对次数 } }
+   * 只在「答错」时创建记录，通过时立刻删除 ——
+   * 所以「存在记录」= 这个词还没过（可用来统计本轮通过 / 待巩固）。
+   */
+  const PASS_MAP_NAME = { study: 'studyPass', spell: 'spellPass', listen: 'listenPass' };
+  const PassRule = {
+    map(mode) {
+      const name = PASS_MAP_NAME[mode] || 'studyPass';
+      if (!state[name] || typeof state[name] !== 'object') state[name] = {};
+      return state[name];
+    },
+    /** 读取某词当前状态 { streak, need, remaining, started } */
+    info(mode, key) {
+      const rec = this.map(mode)[key];
+      const need = (rec && rec.n) || PASS_STREAK_DEFAULT;
+      const streak = (rec && rec.s) || 0;
+      return {
+        streak,
+        need,
+        remaining: Math.max(0, need - streak),
+        started: !!rec          // true = 这个词答错过，正处在"要连续答对 2 次"的阶段
+      };
+    },
+    /** 答对一次 → { passed, streak, need, remaining }；passed=true 表示这次通过 */
+    hit(mode, key) {
+      const m = this.map(mode);
+      const rec = m[key] || { s: 0, n: PASS_STREAK_DEFAULT };
+      rec.s = (rec.s || 0) + 1;
+      if (rec.s >= (rec.n || PASS_STREAK_DEFAULT)) {
+        delete m[key];
+        return { passed: true, streak: rec.s, need: rec.n || PASS_STREAK_DEFAULT, remaining: 0 };
+      }
+      m[key] = rec;
+      return { passed: false, streak: rec.s, need: rec.n, remaining: rec.n - rec.s };
+    },
+    /** 答错一次 → 清零并把要求提到「连续答对 2 次」 */
+    miss(mode, key) {
+      const m = this.map(mode);
+      m[key] = { s: 0, n: PASS_STREAK_AFTER_MISS };
+      return { streak: 0, need: PASS_STREAK_AFTER_MISS, remaining: PASS_STREAK_AFTER_MISS };
+    },
+    /** 通过后 / 删除单词时清掉记录 */
+    clear(mode, key) { delete this.map(mode)[key]; },
+    clearAll(mode) { state[PASS_MAP_NAME[mode] || 'studyPass'] = {}; }
+  };
+
+  /** 某个词通过后，把它在「剩余队列」里还没考到的重复卡清掉，避免过了又出现 */
+  function purgeQueueTail(mode, key) {
+    const q = mode === 'spell' ? state.spellQueue : state.listenQueue;
+    const idx = mode === 'spell' ? state.spellIndex : state.listenIndex;
+    if (!Array.isArray(q)) return;
+    const kept = q.slice(idx + 1).filter(x => x && x.key !== key);
+    q.length = Math.min(idx + 1, q.length);
+    for (const x of kept) q.push(x);
+  }
+
+  /** 复制一张卡重新排进队尾（清掉上一次的作答痕迹；srs 仍共享同一对象） */
+  function cloneCard(item) {
+    return {
+      ...item,
+      _lastOk: undefined,
+      _userInput: undefined,
+      _hasJudged: false,
+      _judgedOnce: false,
+      _judgedOk: undefined,
+      _inRetry: false
+    };
+  }
+
+  /** 跳过拼写队列里「已经通过」的重复卡（用于「下一题」推进） */
+  function skipPassedSpellCards() {
+    while (state.spellIndex < state.spellQueue.length) {
+      const c = state.spellQueue[state.spellIndex];
+      if (!c) { state.spellIndex++; continue; }
+      // 已通过 = 没有待完成的通过要求，且上一次判定是"拼对"
+      if (!PassRule.info('spell', c.key).started && c._lastOk === true) { state.spellIndex++; continue; }
+      break;
+    }
+  }
+
+  /** 本轮统计（按词去重）：通过 / 待巩固 */
+  function roundStats(mode, queue) {
+    const keys = Array.from(new Set((queue || []).map(x => x && x.key).filter(Boolean)));
+    let pending = 0;
+    for (const k of keys) if (PassRule.info(mode, k).started) pending++;
+    return { total: keys.length, passed: keys.length - pending, pending };
+  }
+
+  /* ---------- 0.7 v6.3：进度重置（背诵 / 拼写 / 听音 三模式各自可重置） ---------- */
+  /** 把一批词（词对象或字符串）转成通过规则用的 key */
+  function passKeysOf(words) {
+    return (words || [])
+      .map(w => window.VocabData.normalizeKey(typeof w === 'string' ? w : (w && w.word)))
+      .filter(Boolean);
+  }
+
+  /** 清掉某模式下一批词的「连续答对」记录，返回清掉的条数 */
+  function clearPassKeys(mode, keys) {
+    const m = PassRule.map(mode);
+    let n = 0;
+    for (const k of keys) {
+      if (Object.prototype.hasOwnProperty.call(m, k)) { delete m[k]; n++; }
+    }
+    return n;
+  }
+
+  /** 把一批错词的「已答对数 + 复习阶梯」清零（错词本身仍留在错词本里） */
+  function resetWrongProgress(words) {
+    const keys = new Set(passKeysOf(words));
+    let n = 0;
+    for (const w of state.wrongBook) {
+      if (!keys.has(window.VocabData.normalizeKey(w.word))) continue;
+      w.correctCount = 0;
+      w.srs = newSrsRecord();
+      w.lastSeen = Date.now();
+      n++;
+    }
+    return n;
+  }
+
+  /** 背诵页的「重置进度」：清空当前单词本（或当前错词范围）的学习进度，从头重学 */
+  function resetStudyProgress() {
+    // A. 错词复习会话 → 重置这个范围里的错词进度
+    if (state.activeWrongSession) {
+      const scope = state.wrongSessionScope || 'all';
+      const due = filterWrongByScope(state.wrongBook.filter(w => (w.correctCount || 0) < 3), scope);
+      if (!due.length) { toast('当前范围没有待复习的错词'); return; }
+      if (!confirm(
+        `重置「${wrongScopeLabel(scope)}」的错词复习进度？\n\n` +
+        `· ${due.length} 个错词的「已答对次数」清零，复习阶梯回到第 1 天\n` +
+        `· 复习进度回到第 1 个词，可以重新过一遍\n\n` +
+        `（错词仍保留在错词本里；单词本的背诵进度不受影响）`
+      )) return;
+      const n = resetWrongProgress(due);
+      delete state.lastStudyMap[wrongStudyKey(scope)];
+      if (scope === 'all') delete state.lastStudyMap['wrong']; // 兼容旧版单份 'wrong' 快照
+      state.lastStudy = null;
+      state.studyQueue = [];
+      state.studyIndex = 0;
+      state.studyRevealed = false;
+      state._wrongQueueScope = null;
+      renderWrongSession();
+      toast(`已重置 ${n} 个错词的复习进度，可以重新过了`);
+      return;
+    }
+    // B. 普通单词本背诵 → 清空该本的已掌握 + 连续计数
+    const book = state.books.find(b => b.id === state.activeBookId);
+    if (!book) return;
+    if (!book.words.length) { toast('这本还没有词条'); return; }
+    if (!confirm(
+      `重置《${book.name}》的背诵进度？\n\n` +
+      `· 全 ${book.words.length} 个词的「已掌握」标记清空\n` +
+      `· 本轮的「连续认识」计数清空\n` +
+      `· 背诵进度回到第 1 个词，可以重新学一遍\n\n` +
+      `（错词本、艾宾浩斯复习计划不受影响）`
+    )) return;
+    book.progress.mastered = new Set();
+    clearPassKeys('study', passKeysOf(book.words));
+    delete state.lastStudyMap[book.id];
+    state.lastStudy = null;
+    state.studyQueue = [];
+    state.studyIndex = 0;
+    state.studyRevealed = false;
+    renderStudy();
+    toast(`已重置《${book.name}》的背诵进度，从头开始背`);
+  }
+
+  /** 拼写页的「重置进度」：清空当前范围的拼写进度，队列重建，从头再拼 */
+  function resetSpellProgress() {
+    const scope = state.spellScope || 'due';
+    const label = spellSourceLabel(scope);
+    const book = scope.startsWith('book:') ? state.books.find(b => b.id === scope.slice(5)) : null;
+    let words = [];
+    const lines = [];
+    if (book) {
+      words = book.words.slice();
+      if (!words.length) { toast('这本还没有词条'); return; }
+      lines.push(`· 《${book.name}》全 ${words.length} 个词的「已掌握」标记清空，全部重新进入拼写`);
+    } else if (scope.startsWith('wrong:')) {
+      // wrong（全部）/ wrong:book:<id>（某词本错词）/ wrong:orphans（未归类错词）
+      let wrongList = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+      if (scope.startsWith('wrong:book:')) {
+        const id = scope.slice('wrong:book:'.length);
+        wrongList = wrongList.filter(w => w.sources && w.sources.includes(id));
+      } else if (scope === 'wrong:orphans') {
+        wrongList = wrongList.filter(w => !w.sources || !w.sources.length);
+      }
+      words = wrongList;
+      if (!words.length) { toast('错词本里没有待复习的词'); return; }
+      lines.push(`· ${words.length} 个错词的「已答对次数」清零，复习阶梯回到第 1 天`);
+    } else {
+      // 按当前范围重新收集（避免显示的队列与所选范围不一致时清错词）
+      words = collectSpellItems(scope);
+      if (!words.length && state.spellQueue.length) words = state.spellQueue;
+      if (!words.length) { toast(`「${label}」没有可拼写的条目`); return; }
+      lines.push(`· 这 ${words.length} 个词的「连续拼对」计数清空`);
+    }
+    lines.push('· 拼写进度回到第 1 题，可以重新拼一遍');
+    if (!confirm(`重置「${label}」的拼写进度？\n\n${lines.join('\n')}\n\n（错词本里的错词不会被删除）`)) return;
+    clearPassKeys('spell', passKeysOf(words));
+    if (book) book.progress.mastered = new Set();
+    if (scope.startsWith('wrong:')) resetWrongProgress(words);
+    delete state.lastSpellMap[scope];
+    state.lastSpell = null;
+    state.spellQueue = [];
+    state.spellIndex = 0;
+    state.spellAnswered = false;
+    startSpellScope(scope);
+    toast(`已重置「${label}」的拼写进度，从头开始拼`);
+  }
+
+  /** 听音页的「重置进度」：清空当前范围的听音进度，队列重建，从头再听 */
+  function resetListenProgress() {
+    const scope = state.listenScope || 'all';
+    const label = listenScopeLabel(scope);
+    const book = scope.startsWith('book:') ? state.books.find(b => b.id === scope.slice(5)) : null;
+    let words = [];
+    const lines = [];
+    if (book) {
+      words = book.words.slice();
+      if (!words.length) { toast('这本还没有词条'); return; }
+      lines.push(`· 《${book.name}》全 ${words.length} 个词的「已掌握」标记清空，全部重新进入听音`);
+    } else if (scope === 'wrong') {
+      words = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+      if (!words.length) { toast('错词本里没有待复习的词'); return; }
+      lines.push(`· ${words.length} 个错词的「已答对次数」清零，复习阶梯回到第 1 天`);
+    } else {
+      // 按当前范围重新收集（避免显示的队列与所选范围不一致时清错词）
+      words = collectListenItems(scope);
+      if (!words.length && state.listenQueue.length) words = state.listenQueue;
+      if (!words.length) { toast(`「${label}」没有可听音的条目`); return; }
+      lines.push(`· 这 ${words.length} 个词的「连续认识」计数清空`);
+    }
+    lines.push('· 听音进度回到第 1 题，可以重新听一遍');
+    if (!confirm(`重置「${label}」的听音进度？\n\n${lines.join('\n')}\n\n（错词本里的错词不会被删除）`)) return;
+    clearPassKeys('listen', passKeysOf(words));
+    if (book) book.progress.mastered = new Set();
+    if (scope === 'wrong') resetWrongProgress(words);
+    delete state.lastListenMap[scope];
+    state.lastListen = null;
+    state.listenQueue = [];
+    state.listenIndex = 0;
+    state.listenAnswered = false;
+    state.listenLastDecision = null;
+    state._listenKnowCount = 0;
+    state._listenUnknowCount = 0;
+    startListen();
+    toast(`已重置「${label}」的听音进度，从头开始听`);
+  }
+
+  /** 听音范围的中文标签 */
+  function listenScopeLabel(scope) {
+    if (scope === 'wrong') return '错词本';
+    if (scope === 'all') return '全部未掌握';
+    if (scope && scope.startsWith('book:')) {
+      const b = state.books.find(x => x.id === scope.slice(5));
+      return b ? `《${b.name}》` : '（词本已删除）';
+    }
+    return scope || '';
+  }
 
   /** 创建一个新的 SRS 记录（初次学习） */
   function newSrsRecord() {
@@ -137,6 +407,12 @@
       lastStudy: attachMap(state.lastStudy, state.lastStudyMap),
       lastSpell: attachMap(state.lastSpell, state.lastSpellMap),
       lastListen: attachMap(state.lastListen, state.lastListenMap),
+      // v6.2：三模式共用的「通过规则」记录（答错后需连续答对 2 次，刷新后依然生效）
+      passRule: {
+        study: state.studyPass || {},
+        spell: state.spellPass || {},
+        listen: state.listenPass || {}
+      },
       // v5：保存用户偏好（v5.9：并记住上次所在的范围，刷新后可直接续上进度）
       prefs: {
         autoSpeak: state.autoSpeak,
@@ -166,6 +442,12 @@
       }));
       state.wrongBook = data.wrongBook || [];
       state.userDict = data.userDict || {};
+      // v6.2：恢复三模式的通过规则记录
+      if (data.passRule && typeof data.passRule === 'object') {
+        state.studyPass = data.passRule.study || {};
+        state.spellPass = data.passRule.spell || {};
+        state.listenPass = data.passRule.listen || {};
+      }
       // 兼容旧数据：补 type 与 srs；清洗 DICT 占位释义
       for (const b of state.books) {
         for (const w of b.words) {
@@ -180,6 +462,8 @@
         if (typeof w.correctCount !== 'number') w.correctCount = 0;
         if (isPlaceholderMeaning(w.meaning)) w.meaning = '';
       }
+      // v6.1：补回历史错词缺失的中文释义（只填空，不覆盖）
+      try { healWrongMeanings(); } catch (e) { console.warn('healWrongMeanings on hydrate failed', e); }
       // 同步注入给 data.js 的 lookup
       window.VocabData.setUserDict(state.userDict);
 
@@ -325,7 +609,11 @@
       // v6：页面回到前台 / 从暂停态恢复 —— 修复"放着放着就没声了"
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible' && !this.muted) {
-          try { speechSynthesis.resume(); } catch (e) {}
+          try {
+            // v6.6：idle 时清掉可能被卡住的残留状态（不会打断正在播放的内容）
+            if (!speechSynthesis.speaking && !speechSynthesis.pending) speechSynthesis.cancel();
+            speechSynthesis.resume();
+          } catch (e) {}
         }
       });
     },
@@ -651,7 +939,8 @@
         const savedIdx = savedStudy.index || 0;
         state.studyIndex = savedIdx >= rebuilt.length ? rebuilt.length : savedIdx;
         state.studyRevealed = !!savedStudy.revealed;
-        state.studyStreak = { ...(savedStudy.streak || {}) };
+        // v6.2：通过规则记录是「按词全局」的（state.studyPass），随 localStorage 持久化，
+        // 换单词本/刷新都不丢，因此不从这里覆盖恢复
         restored = true;
       }
     }
@@ -659,7 +948,6 @@
       state.studyQueue = freshQueue;
       state.studyIndex = 0;
       state.studyRevealed = false;
-      state.studyStreak = {};
     }
     saveLastStudy();
 
@@ -707,8 +995,8 @@
         index: state.studyIndex,
         revealed: !!state.studyRevealed,
         queue,
-        // v6：把「连续认识」计数一起存下来，切走再回来不会白答
-        streak: { ...(state.studyStreak || {}) },
+        // v6.2：「连续认识」计数改由全局 state.studyPass 保存（见 persist 的 passRule）
+        pass: { ...(state.studyPass || {}) },
         wrongFilter: state.activeWrongSession ? (state.wrongSessionScope || 'all') : null
       };
     }
@@ -743,13 +1031,15 @@
           <div class="icon">🎉</div>
           <h3>本单词本已全部掌握！</h3>
           <p>这本没有要背的了，但错词本里可能还有你的"老大难"。</p>
-          <div style="margin-top:18px" class="row gap">
+          <div style="margin-top:18px" class="row gap wrap">
             <button class="btn" id="startSpellOfBook">✍ 拼写本词本</button>
             <button class="btn primary" id="goWrong">去复习错词本</button>
+            <button class="btn ghost danger" id="resetStudyAll" title="清空这本的已掌握标记，从头再背一遍">🔄 重置进度，重新背</button>
           </div>
         </div>`;
       $('#startSpellOfBook')?.addEventListener('click', () => startSpellScope('book:' + book.id));
       $('#goWrong').addEventListener('click', () => startWrongSession('book:' + book.id));
+      $('#resetStudyAll')?.addEventListener('click', () => resetStudyProgress());
       return;
     }
 
@@ -759,21 +1049,22 @@
         <div class="study-empty">
           <div class="icon">✅</div>
           <h3>本轮完成！</h3>
-          <p>每个词都<b>连续认识 ${STUDY_PASS_STREAK} 次</b>才算过，已通过的不再出现；<b>不认识</b>的已加入错词本（需累计答对 3 次才能毕业）。</p>
-          <div style="margin-top:18px" class="row gap">
+          <p>答对一遍即可通过，通过后不再出现；<b>点不认识会立即加入错词本</b>，该词需要<b>再连续认识 2 次</b>才算过（中途再点不认识则重新数）。错词本需累计答对 3 次才毕业。</p>
+          <div style="margin-top:18px" class="row gap wrap">
             <button class="btn" id="restartRound">再走一遍（错词优先）</button>
             <button class="btn primary" id="goWrong2">复习错词本</button>
             <button class="btn" id="spellThisBook">✍ 拼写本词本</button>
+            <button class="btn ghost danger" id="resetStudyRound" title="清空这本的已掌握标记与连续计数，从头再背一遍">🔄 重置进度，重新背</button>
           </div>
         </div>`;
       $('#restartRound').addEventListener('click', () => {
         state.studyIndex = 0;
         state.studyRevealed = false;
-        state.studyStreak = {};
         renderStudyCard();
       });
       $('#goWrong2').addEventListener('click', () => startWrongSession('book:' + book.id));
       $('#spellThisBook')?.addEventListener('click', () => startSpellScope('book:' + book.id));
+      $('#resetStudyRound')?.addEventListener('click', () => resetStudyProgress());
       return;
     }
 
@@ -781,16 +1072,23 @@
     const entry = window.VocabData.lookup(w.word);
     const pct = ((state.studyIndex) / state.studyQueue.length) * 100;
     const typeTag = renderTypeTag(w.type);
-    const streak = state.studyStreak[w.word] || 0;
-    const needMore = Math.max(0, STUDY_PASS_STREAK - streak);
+    // v6.2：读这个词当前的通过进度（未答错过 → 只需 1 次；答错过 → 需连续 2 次）
+    const pass = PassRule.info('study', window.VocabData.normalizeKey(w.word));
+    const streakTag = pass.started ? ` · 已连续认识 ${pass.streak}/${pass.need}` : '';
+    const knowLabel = pass.started
+      ? `认识 ✓（还要连续答对 ${pass.remaining} 次）`
+      : `认识 ✓`;
 
     area.innerHTML = `
-      <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+      <div class="progress-row">
+        <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+        <button class="btn ghost danger reset-inline" id="studyResetInline" type="button" title="重置背诵进度，从头再背">🔄 重置进度</button>
+      </div>
       <div class="flashcard">
         <div class="card-actions" title="点击可重新朗读">
           ${Speech.button(w.word, { small: true })}
         </div>
-        <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · ${typeTag}${streak ? ` · 已连续认识 ${streak}/${STUDY_PASS_STREAK}` : ''}</div>
+        <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · ${typeTag}${streakTag}</div>
         <div class="word ${w.type === 'sentence' ? 'sentence' : (w.type === 'phrase' ? 'phrase' : '')}">${escapeHtml(w.word)}</div>
         ${entry.phonetic ? `<div class="phonetic">${escapeHtml(entry.phonetic)}</div>` : `<div class="phonetic muted">（暂无音标）</div>`}
         ${state.studyRevealed
@@ -808,7 +1106,7 @@
           </button>
           <div class="actions-main">
             <button class="btn unknow" id="btnUnknow">不认识 → 入错词本</button>
-            <button class="btn know" id="btnKnow">认识 ✓${streak ? `（再需 ${needMore} 次）` : `（需连续 ${STUDY_PASS_STREAK} 次）`}</button>
+            <button class="btn know" id="btnKnow">${knowLabel}</button>
           </div>
         </div>
       ` : ''}
@@ -854,6 +1152,10 @@
       $('#btnUnknow').addEventListener('click', () => handleAnswer(false, w));
       $('#btnKnow').addEventListener('click', () => handleAnswer(true, w));
     }
+
+    // v6.3：进度条旁的重置按钮（清空这本的已掌握与连续计数，从头再背）
+    const _resetInline = $('#studyResetInline');
+    if (_resetInline) _resetInline.addEventListener('click', (e) => { e.stopPropagation(); resetStudyProgress(); });
   }
 
   /** 把 type 字段渲染成 pill 文字 */
@@ -865,7 +1167,7 @@
 
   function handleAnswer(know, word) {
     const book = state.books.find(b => b.id === state.activeBookId);
-    if (!state.studyStreak) state.studyStreak = {};
+    const key = window.VocabData.normalizeKey(word.word);
 
     if (know) {
       // 更新 SRS：按照认识次数推进到下一个艾宾浩斯阶梯
@@ -873,12 +1175,11 @@
       srs.lastReviewed = Date.now();
       nextReviewAfter(srs, true);
 
-      const streak = (state.studyStreak[word.word] || 0) + 1;
-      state.studyStreak[word.word] = streak;
+      // v6.2：第一次就答对 → 直接通过；答错过 → 需连续答对 2 次
+      const r = PassRule.hit('study', key);
 
-      if (streak >= STUDY_PASS_STREAK) {
-        // 连续认识达标 → 通过，不再出现
-        delete state.studyStreak[word.word];
+      if (r.passed) {
+        // 通过 → 不再出现
         book.progress.mastered.add(word.word);
         const wrong = state.wrongBook.find(w => w.word === word.word);
         if (wrong) {
@@ -887,28 +1188,28 @@
           ensureSrs(wrong);
           if (wrong.correctCount >= 3) {
             state.wrongBook = state.wrongBook.filter(w => w.word !== word.word);
-            toast(`「${word.word}」连续认识 ${STUDY_PASS_STREAK} 次 ✓ 并从错词本毕业！`);
+            toast(`「${word.word}」通过 ✓ 并从错词本毕业！`);
           } else {
-            toast(`「${word.word}」连续认识 ${STUDY_PASS_STREAK} 次 ✓ · 错词本累计 ${wrong.correctCount}/3`);
+            toast(`「${word.word}」通过 ✓ · 错词本累计 ${wrong.correctCount}/3`);
           }
         } else {
-          toast(`「${word.word}」连续认识 ${STUDY_PASS_STREAK} 次，通过 ✓`);
+          toast(`「${word.word}」认识，通过 ✓`);
         }
       } else {
-        // 还没连续达标 → 这张卡重新排回队尾，稍后再考
+        // 这个词之前答错过 → 还要连续答对 r.remaining 次，卡片重新排回队尾
         state.studyQueue.push(word);
         const wrong = state.wrongBook.find(w => w.word === word.word);
-        toast(`「${word.word}」已认识 ${streak}/${STUDY_PASS_STREAK} · 稍后会再考一次${wrong ? `（错词本 ${wrong.correctCount || 0}/3）` : ''}`);
+        toast(`「${word.word}」已认识 ${r.streak}/${r.need} · 还要再连续答对 ${r.remaining} 次才算过${wrong ? `（错词本 ${wrong.correctCount || 0}/3）` : ''}`);
       }
     } else {
       // 不认识 → 计数清零、立即进错词本，并把词卡重新排回队尾
-      // （至少要再连续答对 STUDY_PASS_STREAK 次才能过，也就是这张卡还会再出现至少两次）
-      state.studyStreak[word.word] = 0;
+      // （之后必须连续答对 PASS_STREAK_AFTER_MISS 次才算过 → 这张卡至少还会再出现两次）
+      const r = PassRule.miss('study', key);
       addToWrongBook(word.word, word.type, book.id, word.meaning);
       ensureSrs(word).lastReviewed = Date.now();
       nextReviewAfter(word.srs, false);
       state.studyQueue.push(word);
-      toast(`「${word.word}」已加入错词本 · 需连续认识 ${STUDY_PASS_STREAK} 次才算过`);
+      toast(`「${word.word}」已加入错词本 · 之后需再连续认识 ${r.need} 次才算过`);
     }
     persist();
     state.studyIndex++;
@@ -1071,7 +1372,7 @@
       }
       state._wrongQueueScope = scope;
       state.wrongSpellAnswered = false;
-      state.studyStreak = {};   // v6：错词复习不共用单词本的「连续认识」计数
+      // v6.2：错词复习走它自己的「累计答对 3 次毕业」逻辑，不动单词本的通过规则记录
       saveLastStudy();
     }
 
@@ -1130,7 +1431,10 @@
     const spellOk = !!state.wrongSpellOk;
 
     area.innerHTML = `
-      <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+      <div class="progress-row">
+        <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+        <button class="btn ghost danger reset-inline" id="studyResetInline" type="button" title="重置这个范围的错词复习进度，从头再过一遍">🔄 重置进度</button>
+      </div>
 
       <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
         <span class="muted small">复习范围：</span>
@@ -1361,7 +1665,17 @@
       state._wrongQueueScope = null;
       renderStudy();
     });
-    $('#spellWrongHere')?.addEventListener('click', () => startSpellScope(scope === 'all' ? 'wrong' : scope));
+    $('#spellWrongHere')?.addEventListener('click', () => {
+      // 当前错词范围 → 进入「只拼这批错词」的拼写：all→wrong，book:<id>→wrong:book:<id>，orphans→wrong:orphans
+      const target = scope === 'all' ? 'wrong'
+        : scope === 'orphans' ? 'wrong:orphans'
+        : ('wrong:' + scope);
+      startSpellScope(target);
+    });
+
+    // v6.3：进度条旁的重置按钮（重置本范围的错词复习进度）
+    const _resetInlineWrong = $('#studyResetInline');
+    if (_resetInlineWrong) _resetInlineWrong.addEventListener('click', (e) => { e.stopPropagation(); resetStudyProgress(); });
   }
 
   function bindStudy() {
@@ -1370,15 +1684,8 @@
       state.activeWrongSession = false;
       renderStudy();
     });
-    $('#restartBook').addEventListener('click', () => {
-      const book = state.books.find(b => b.id === state.activeBookId);
-      if (!book) return;
-      if (!confirm(`确定重置《${book.name}》的背诵进度？已掌握记录将清空（不影响错词本）。`)) return;
-      book.progress.mastered = new Set();
-      persist();
-      renderStudy();
-      toast('已重置进度');
-    });
+    // v6.3：重置进度 —— 清空该本的已掌握 + 连续计数，可以重新学一遍
+    $('#restartBook').addEventListener('click', () => resetStudyProgress());
     $('#studyWrong').addEventListener('click', () => {
       // v5.9：只复习「错词本页面当前选中范围」的错词（跟随上方下拉）
       const picker = $('#wrongBookPicker');
@@ -1578,35 +1885,167 @@
     `);
   }
 
+  // 构造完整备份对象（导出下载 与 本地文件夹自动备份 共用）
+  function buildFullBackup() {
+    return {
+      exportAt: new Date().toISOString(),
+      version: 'vocabmaster.v1',
+      books: state.books.map(b => ({
+        id: b.id,
+        name: b.name,
+        createdAt: b.createdAt,
+        words: b.words,
+        progress: { mastered: Array.from(b.progress.mastered) }
+      })),
+      wrongBook: state.wrongBook,
+      userDict: state.userDict,
+      lastStudy: attachMap(state.lastStudy, state.lastStudyMap),
+      lastSpell: attachMap(state.lastSpell, state.lastSpellMap),
+      lastListen: attachMap(state.lastListen, state.lastListenMap),
+      passRule: {
+        study: state.studyPass || {},
+        spell: state.spellPass || {},
+        listen: state.listenPass || {}
+      },
+      prefs: {
+        autoSpeak: state.autoSpeak,
+        wrongFilter: state.wrongFilter,
+        reviewFilter: state.reviewFilter,
+        activeBookId: state.activeBookId,
+        spellScope: state.spellScope,
+        listenScope: state.listenScope,
+        wrongSessionScope: state.wrongSessionScope,
+        wrongCardMode: state.wrongCardMode
+      }
+    };
+  }
+
+  /* ---------- 本地文件夹自动备份（File System Access API） ---------- */
+  // 把学习数据覆盖写入用户选定的本地文件夹（vocab-data.json）。
+  // 仅 Chromium 系（Chrome / Edge）支持 showDirectoryPicker；Safari / Firefox 用「导出全部（JSON）」手动下载兜底。
+  const BACKUP_DIR_STORE = 'vocabmaster.backupDir';
+  const BACKUP_FILE_NAME = 'vocab-data.json';
+  const LS_LAST_LOCAL_BACKUP = 'vocabmaster.lastLocalBackup';
+
+  function _idb() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('vocabmaster-backup', 1);
+      r.onupgradeneeded = () => { try { r.result.createObjectStore('handles'); } catch (e) {} };
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+  async function _saveDirHandle(h) {
+    const db = await _idb();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('handles', 'readwrite');
+      tx.objectStore('handles').put(h, BACKUP_DIR_STORE);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  async function _getDirHandle() {
+    const db = await _idb();
+    return new Promise((res, rej) => {
+      const tx = db.transaction('handles', 'readonly');
+      const rq = tx.objectStore('handles').get(BACKUP_DIR_STORE);
+      rq.onsuccess = () => res(rq.result || null);
+      rq.onerror = () => rej(rq.error);
+    });
+  }
+
+  // auto=true 时不主动弹权限窗（用于打开应用 / 切后台时的静默备份）
+  async function writeLocalBackup(auto) {
+    if (!window.showDirectoryPicker) return { ok: false, reason: 'unsupported' };
+    let handle;
+    try { handle = await _getDirHandle(); } catch (e) { handle = null; }
+    if (!handle) return { ok: false, reason: 'no-dir' };
+    try {
+      const perm = { mode: 'readwrite' };
+      const cur = await handle.queryPermission(perm);
+      if (cur !== 'granted') {
+        if (auto) return { ok: false, reason: 'no-permission' };
+        if ((await handle.requestPermission(perm)) !== 'granted') return { ok: false, reason: 'no-permission' };
+      }
+      const data = buildFullBackup();
+      const fileHandle = await handle.getFileHandle(BACKUP_FILE_NAME, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(JSON.stringify(data, null, 2));
+      await writable.close();
+      const ts = new Date().toISOString();
+      try { localStorage.setItem(LS_LAST_LOCAL_BACKUP, ts); } catch (e) {}
+      return { ok: true, at: ts };
+    } catch (e) {
+      console.error('writeLocalBackup failed', e);
+      return { ok: false, reason: 'error', error: String(e) };
+    }
+  }
+
+  function fmtLocalBackupStatus() {
+    const el = $('#backupStatus');
+    if (!el) return;
+    if (!window.showDirectoryPicker) {
+      el.innerHTML = '当前浏览器不支持「选择文件夹」自动备份，请用上方 <b>导出全部（JSON）</b> 手动下载（Chrome / Edge 支持自动备份）';
+      return;
+    }
+    let ts = null;
+    try { ts = localStorage.getItem(LS_LAST_LOCAL_BACKUP); } catch (e) {}
+    if (ts) {
+      const d = new Date(ts);
+      el.innerHTML = `上次本地备份：<b>${d.toLocaleString('zh-CN')}</b> → <code>vocab-data.json</code>`;
+    } else {
+      el.innerHTML = '尚未设置本地备份文件夹，点「📁 选择本地备份文件夹」并选中 <b>~/Documents/雅思词汇备份</b>';
+    }
+  }
+
+  function bindLocalBackup() {
+    const pickBtn = $('#pickBackupDir');
+    const nowBtn = $('#backupNow');
+    if (pickBtn) {
+      pickBtn.addEventListener('click', async () => {
+        if (!window.showDirectoryPicker) {
+          toast('当前浏览器不支持选择文件夹，请用「导出全部（JSON）」手动下载备份');
+          return;
+        }
+        try {
+          const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+          await _saveDirHandle(handle);
+          const r = await writeLocalBackup(false);
+          if (r.ok) toast('✅ 已选择文件夹并立即备份了一份数据');
+          else if (r.reason === 'no-permission') toast('已保存文件夹，但本次未授权写入，下次打开应用会自动重试');
+          else toast('已保存备份文件夹');
+          fmtLocalBackupStatus();
+        } catch (e) {
+          if (e && e.name === 'AbortError') return; // 用户取消选择
+          console.error(e);
+          toast('选择文件夹失败：' + (e && e.message ? e.message : e));
+        }
+      });
+    }
+    if (nowBtn) {
+      nowBtn.addEventListener('click', async () => {
+        const r = await writeLocalBackup(false);
+        if (r.ok) { toast('✅ 已立即备份数据到本地文件夹'); fmtLocalBackupStatus(); }
+        else if (r.reason === 'no-dir') toast('请先点「📁 选择本地备份文件夹」');
+        else if (r.reason === 'no-permission') toast('浏览器未授权写入，请重新点「选择本地备份文件夹」');
+        else if (r.reason === 'unsupported') toast('当前浏览器不支持，请用「导出全部（JSON）」下载');
+        else toast('备份失败：' + (r.error || r.reason));
+      });
+    }
+    fmtLocalBackupStatus();
+    // 打开应用时静默备份一次（若已设置文件夹且已授权）
+    if (window.showDirectoryPicker) {
+      writeLocalBackup(true).then(r => { if (r.ok) fmtLocalBackupStatus(); });
+    }
+    // 切换到后台（离开页面）时再静默备份一次，确保本次学习进度落盘
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') writeLocalBackup(true).then(r => { if (r.ok) fmtLocalBackupStatus(); });
+    });
+  }
+
   function bindBooks() {
     $('#exportAll').addEventListener('click', () => {
-      // 完整备份：包含所有可恢复字段，确保导入后可完全还原
-      const data = {
-        exportAt: new Date().toISOString(),
-        version: 'vocabmaster.v1',
-        books: state.books.map(b => ({
-          id: b.id,
-          name: b.name,
-          createdAt: b.createdAt,
-          words: b.words,
-          progress: { mastered: Array.from(b.progress.mastered) }
-        })),
-        wrongBook: state.wrongBook,
-        userDict: state.userDict,
-        lastStudy: attachMap(state.lastStudy, state.lastStudyMap),
-        lastSpell: attachMap(state.lastSpell, state.lastSpellMap),
-        lastListen: attachMap(state.lastListen, state.lastListenMap),
-        prefs: {
-          autoSpeak: state.autoSpeak,
-          wrongFilter: state.wrongFilter,
-          reviewFilter: state.reviewFilter,
-          activeBookId: state.activeBookId,
-          spellScope: state.spellScope,
-          listenScope: state.listenScope,
-          wrongSessionScope: state.wrongSessionScope,
-          wrongCardMode: state.wrongCardMode
-        }
-      };
+      const data = buildFullBackup();
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1815,6 +2254,11 @@
     } else {
       state.wrongBook = incWrong.map(normalizeWrong);
     }
+    // v6.1：补齐云端历史错词缺失的中文释义
+    try {
+      const fixed = healWrongMeanings();
+      if (fixed > 0) toast(`🩹 已为 ${fixed} 条错词补回中文释义`);
+    } catch (e) { console.warn('healWrongMeanings failed', e); }
 
     // 4. 进度：仅在本地为空时才接受导入的进度（避免覆盖当前进行中的状态）
     // v5.9：同时接收「按单词本分片」的进度 map（已有的分片不被覆盖）
@@ -1864,6 +2308,44 @@
       })),
       progress: { mastered: new Set(b.progress?.mastered || []) }
     };
+  }
+
+  /* v6.1：错词释义自愈
+     云端存量 wrong_book 里有大量 meaning 为空的历史数据（表现为拼写/复习时不显示中文）。
+     每次载入或导入后，从「单词本 → 用户字典 → 内置词库」逐级回填，只填空、不覆盖已有释义。 */
+  function healWrongMeanings() {
+    const index = Object.create(null);
+    const put = (word, meaning) => {
+      if (!word || !meaning) return;
+      const k = String(word).toLowerCase();
+      if (!index[k]) index[k] = String(meaning).trim();
+    };
+    for (const b of (state.books || [])) {
+      for (const w of (b.words || [])) put(w.word, w.meaning);
+    }
+    try {
+      const dict = state.userDict || {};
+      for (const word of Object.keys(dict)) {
+        const e = dict[word] || {};
+        put(word, e.cn ? ((e.pos ? e.pos + ' ' : '') + e.cn) : null);
+      }
+    } catch (e) {}
+    try {
+      for (const w of (state.wrongBook || [])) put(w.word, w.meaning);
+    } catch (e) {}
+
+    let fixed = 0;
+    for (const w of (state.wrongBook || [])) {
+      if (w && !String(w.meaning || '').trim()) {
+        const m = index[String(w.word).toLowerCase()];
+        if (m) { w.meaning = m; fixed++; continue; }
+        try {
+          const e = window.VocabData && window.VocabData.lookup ? window.VocabData.lookup(w.word) : null;
+          if (e && e.cn) { w.meaning = ((e.pos ? e.pos + ' ' : '') + e.cn).trim(); fixed++; }
+        } catch (e) {}
+      }
+    }
+    return fixed;
   }
 
   function normalizeWrong(w) {
@@ -2170,10 +2652,17 @@
           });
         }
       }
-    } else if (scope === 'wrong') {
+    } else if (scope === 'wrong' || scope.startsWith('wrong:')) {
+      // 错词本：wrong = 全部未毕业错词；wrong:book:<id> = 某词本的错词；wrong:orphans = 未归类错词
       for (const w of state.wrongBook) {
         if ((w.correctCount || 0) >= 3) continue;
         if (!w.srs) w.srs = newSrsRecord();
+        if (scope.startsWith('wrong:book:')) {
+          const id = scope.slice('wrong:book:'.length);
+          if (!w.sources || !w.sources.includes(id)) continue;
+        } else if (scope === 'wrong:orphans') {
+          if (w.sources && w.sources.length) continue;
+        }
         pushItem(w.word, w.type, { srs: w.srs, sourceBookId: null, wrong: w, meaning: w.meaning });
       }
     } else if (scope.startsWith('book:')) {
@@ -2206,6 +2695,11 @@
     if (scope === 'due') return '今日到期（SRS）';
     if (scope === 'wrong') return '错词本（未毕业）';
     if (scope === 'all') return '全部条目';
+    if (scope.startsWith('wrong:book:')) {
+      const b = state.books.find(x => x.id === scope.slice('wrong:book:'.length));
+      return b ? `《${b.name}》的错词` : '（词本已删除）';
+    }
+    if (scope === 'wrong:orphans') return '未归类错词';
     if (scope.startsWith('book:')) {
       const b = state.books.find(x => x.id === scope.slice(5));
       return b ? `《${b.name}》` : '（词本已删除）';
@@ -2264,6 +2758,12 @@
       // 恢复上次答题结果，确保刷新后仍能看到正确答案
       if (q._lastOk !== undefined) item._lastOk = q._lastOk;
       if (q._userInput !== undefined) item._userInput = q._userInput;
+      // v6.2：连同判定痕迹一起恢复，避免刷新后被重复计分
+      if (item._lastOk !== undefined) {
+        item._judgedOnce = true;
+        item._judgedOk = item._lastOk;
+        item._hasJudged = true;
+      }
       return item;
     }).filter(Boolean);
     if (rebuilt.length !== snapshot.queue.length) return null;
@@ -2307,6 +2807,20 @@
     const opts = ['<option value="due">今日到期（SRS）</option>',
       '<option value="wrong">错词本（未毕业）</option>',
       '<option value="all">全部条目</option>'];
+    // 按词本筛选错词：每个词本一列「《书名》的错词 (N)」
+    const wrongByBook = state.books
+      .map(b => {
+        const n = state.wrongBook.filter(w => (w.correctCount || 0) < 3 && w.sources && w.sources.includes(b.id)).length;
+        return `<option value="wrong:book:${b.id}">《${escapeHtml(b.name)}》的错词 (${n})</option>`;
+      })
+      .join('');
+    if (wrongByBook) {
+      opts.push(`<optgroup label="错词本（按词本）">${wrongByBook}</optgroup>`);
+    }
+    const orphans = state.wrongBook.filter(w => (w.correctCount || 0) < 3 && (!w.sources || !w.sources.length)).length;
+    if (orphans) {
+      opts.push(`<option value="wrong:orphans">未归类错词 (${orphans})</option>`);
+    }
     for (const b of state.books) {
       opts.push(`<option value="book:${b.id}">《${escapeHtml(b.name)}》</option>`);
     }
@@ -2317,6 +2831,10 @@
       startSpellScope(state.spellScope); // 明确「重新生成队列」
     };
     sel.onchange = () => goSpellScope(sel.value, sel);
+
+    // v6.3：重置进度 —— 清空当前范围的拼写进度（含连续拼对计数），队列重建，从头再拼
+    const _resetBtn = $('#spellReset');
+    if (_resetBtn) _resetBtn.onclick = () => resetSpellProgress();
 
     if (!state.spellScope) state.spellScope = 'due';
     sel.value = state.spellScope;
@@ -2364,7 +2882,7 @@
       <div class="row between wrap gap" style="font-size:13px">
         <div>今天到期（艾宾浩斯）：<b style="color:var(--warning)">${dueToday}</b> 个</div>
         <div>本次拼写规模：<b>${total}</b> 个</div>
-        <div class="muted">拼写错的词会自动加入<b>错词本</b>，下次优先级最高；连续对 3 次才毕业。</div>
+        <div class="muted">拼写<b>一遍就对</b>即通过；<b>拼错一遍就进错词本</b>，且该词还要<b>再连续拼对 2 次</b>才算过（中途再错重新数）。错词本累计答对 3 次毕业。</div>
       </div>
     `;
 
@@ -2375,7 +2893,11 @@
           <div class="icon">📭</div>
           <h3>当前来源里没有可拼写条目</h3>
           <p>先把词汇导入单词本，或切换到「错词本 / 全部条目」开始拼写。</p>
+          <div style="margin-top:18px" class="row gap wrap">
+            <button class="btn ghost danger" id="spellResetEmpty" type="button">🔄 重置当前范围进度</button>
+          </div>
         </div>`;
+      $('#spellResetEmpty')?.addEventListener('click', () => resetSpellProgress());
       return;
     }
 
@@ -2384,9 +2906,13 @@
         <div class="icon">✍️</div>
         <h3>准备好开始拼写</h3>
         <p>输入前<b>不显示中文/英文提示</b>，纯靠听音或回忆拼写；提交后若拼错，会立即揭示正确答案、中文释义与例句，并自动加入错词本。</p>
-        <div style="margin-top:18px"><button class="btn primary" id="startSpellNow">开始拼写这 ${total} 个</button></div>
+        <div style="margin-top:18px" class="row gap wrap">
+          <button class="btn primary" id="startSpellNow">开始拼写这 ${total} 个</button>
+          <button class="btn ghost danger" id="spellResetLanding" type="button" title="重置这个范围的拼写进度，队列重建">🔄 重置进度</button>
+        </div>
       </div>`;
     $('#startSpellNow').onclick = () => startSpellScope(state.spellScope);
+    $('#spellResetLanding')?.addEventListener('click', () => resetSpellProgress());
   }
 
   function startSpellScope(scope) {
@@ -2462,30 +2988,43 @@
 
   function renderSpellCard() {
     if (state.spellIndex >= state.spellQueue.length) {
-      const right = state.spellQueue.filter(x => x._lastOk).length;
-      const wrong = state.spellQueue.length - right;
+      // v6.2：按「词」去重统计 —— 一，拼对即通过；二，拼错后要连续拼对 2 次才算通过
+      const stats = roundStats('spell', state.spellQueue);
+      const passed = stats.passed;
+      const pending = stats.pending;
       $('#spellTitle').textContent = '拼写完成';
-      $('#spellSub').textContent = `共 ${state.spellQueue.length} 个 · 对 ${right} · 错 ${wrong}`;
-      $('#spellInfoBar').innerHTML = right === state.spellQueue.length
-        ? `<div style="color:var(--success)">🎉 全部正确！这次没有需要复习的。</div>`
-        : `<div>错词已自动加入错词本，下次到期会再来找你。</div>`;
+      $('#spellSub').textContent = `共 ${stats.total} 个 · 通过 ${passed} · 待巩固 ${pending}`;
+      $('#spellInfoBar').innerHTML = pending === 0
+        ? `<div style="color:var(--success)">🎉 全部通过！这次没有需要复习的。</div>`
+        : `<div>拼错的词已自动加入错词本，且<b>需再连续拼对 2 次</b>才算过；下次到期还会来找你。</div>`;
       $('#spellArea').innerHTML = `
         <div class="study-empty">
           <div class="icon">✅</div>
           <h3>本轮拼写完成</h3>
-          <p>对 <b style="color:var(--success)">${right}</b> · 错 <b style="color:var(--danger)">${wrong}</b></p>
-          <div style="margin-top:18px" class="row gap">
-            <button class="btn primary" id="respellFailed">再练一遍错的（${wrong}）</button>
+          <p>通过 <b style="color:var(--success)">${passed}</b> · 待巩固 <b style="color:var(--danger)">${pending}</b></p>
+          <div style="margin-top:18px" class="row gap wrap">
+            <button class="btn primary" id="respellFailed">再练一遍待巩固的（${pending}）</button>
             <button class="btn" id="spellExit">退出到单词本</button>
+            <button class="btn ghost danger" id="spellResetDone" title="重置这个范围的拼写进度，队列重建，从头再拼">🔄 重置进度，重新拼</button>
           </div>
         </div>
       `;
+      $('#spellResetDone')?.addEventListener('click', () => resetSpellProgress());
       $('#respellFailed').onclick = () => {
-        const failed = state.spellQueue.filter(x => !x._lastOk);
-        if (!failed.length) { toast('都对了，无需重练'); return; }
+        // 「待巩固」= 通过规则里还留着记录（答错过且尚未连续拼对 2 次）
+        const failed = [];
+        const seen = new Set();
+        for (const x of state.spellQueue) {
+          if (seen.has(x.key) || !PassRule.info('spell', x.key).started) continue;
+          seen.add(x.key);
+          failed.push({ ...x, _lastOk: undefined, _userInput: undefined, _hasJudged: false, _inRetry: false });
+        }
+        if (!failed.length) { toast('都通过了，无需重练'); return; }
         state.spellQueue = failed;
         state.spellIndex = 0;
         state.spellAnswered = false;
+        state._spellSpeakOnNext = true;
+        saveLastSpell();
         renderSpellCard();
       };
       $('#spellExit').onclick = () => {
@@ -2519,6 +3058,9 @@
       : w.type === 'phrase' ? '请拼写下面的英文短语（保留空格）'
       : '请拼写下面的英文单词';
 
+    // v6.2：这个词是否已处在「答错后需连续拼对 2 次」的阶段
+    const spellPass = PassRule.info('spell', w.key);
+
     $('#spellTitle').textContent = '拼写训练';
     $('#spellSub').textContent = `来源：${state.spellSource} · ${state.spellIndex + 1} / ${total}`;
     $('#spellInfoBar').innerHTML = `
@@ -2526,10 +3068,14 @@
         <div>来源：<b>${escapeHtml(state.spellSource)}</b></div>
         <div>SRS：第 ${w.srs.repetitions || 0} 阶梯，下次复习 ${new Date(w.srs.nextReview).toLocaleDateString('zh-CN')}</div>
       </div>
+      ${spellPass.started ? `<div style="font-size:13px;margin-top:4px;color:var(--danger)">⚠ 本词已拼错过 · 已连续拼对 ${spellPass.streak}/${spellPass.need} · 还要再连续拼对 <b>${spellPass.remaining}</b> 次才通过</div>` : ''}
     `;
 
     $('#spellArea').innerHTML = `
-      <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+      <div class="progress-row">
+        <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+        <button class="btn ghost danger reset-inline" id="spellResetInline" type="button" title="重置这个范围的拼写进度，从头再拼">🔄 重置进度</button>
+      </div>
       <div class="flashcard spell-card" data-state="${state.spellAnswered ? 'answered' : 'pending'}">
         <div class="card-actions">
           ${Speech.button(w.word, { small: true })}
@@ -2559,7 +3105,9 @@
               ? `
                 <div class="reveal-banner ok-banner">
                   <span class="ok-text">✓ 拼写正确</span>
-                  <span class="muted small" style="margin-left:8px">${(w.srs.interval || 0) > 0 ? `${escapeHtml(String(w.srs.interval))} 天后复习` : '明天复习'}</span>
+                  ${spellPass.started
+                    ? `<span class="bad-text" style="margin-left:8px">已连续拼对 ${spellPass.streak}/${spellPass.need} · 还要再拼对 ${spellPass.remaining} 次才通过</span>`
+                    : `<span class="muted small" style="margin-left:8px">已通过 ✓ ${(w.srs.interval || 0) > 0 ? `${escapeHtml(String(w.srs.interval))} 天后复习` : '明天复习'}</span>`}
                 </div>
                 <div class="reveal-correct">
                   <span class="muted small">你的答案：</span>
@@ -2570,6 +3118,9 @@
                 <div class="reveal-banner wrong-banner">
                   <span class="bad-text">✗ 拼错，已加入错题本</span>
                   ${w._userInput ? `<span class="muted small" style="margin-left:8px">你写的是：<b class="bad-text">${escapeHtml(w._userInput)}</b></span>` : ''}
+                </div>
+                <div class="wrong-retry-note" style="margin:6px 0 2px;font-size:13px">
+                  ⚠ 这个词<b>还要再连续拼对 2 次</b>才算通过（本轮稍后会再考它）
                 </div>
                 <div class="reveal-correct reveal-correct-wrong">
                   <span class="reveal-label">正确答案</span>
@@ -2595,13 +3146,15 @@
               ? `<button class="btn primary" id="spellNext"><kbd>Enter</kbd> 下一题 →</button>`
               : `<button class="btn ghost" id="spellRetry">✏ 改正 ↩</button> <button class="btn primary" id="spellNext"><kbd>Enter</kbd> 下一题 →</button>`}
           </div>
-          <div class="muted small spell-hint">${w._lastOk ? `⌨ <kbd>Enter</kbd> = 下一题` : `⌨ <kbd>Enter</kbd> = 下一题 · <b>改正</b> 后再回车则判定这次答得对不对，<span style="color:var(--success)">连续答对 3 次即可从错题本毕业</span>`}</div>
+          <div class="muted small spell-hint">${w._lastOk
+            ? (spellPass.started ? `⌨ <kbd>Enter</kbd> = 下一题 · 本词还要再连续拼对 <b>${spellPass.remaining}</b> 次才通过` : `⌨ <kbd>Enter</kbd> = 下一题 · 本词已通过`)
+            : `⌨ <kbd>Enter</kbd> = 下一题 · <b>改正</b> 后再回车会判定这次拼得对不对（拼对即计入"连续拼对"次数）· <span style="color:var(--success)">错词本累计答对 3 次毕业</span>`}</div>
         ` : `
           <div class="spell-feedback" id="spellFeedback"></div>
           <div class="actions">
             <button class="btn primary" id="spellCheck" type="button"><kbd>Enter</kbd> 提交 ✍️</button>
           </div>
-          <div class="muted small spell-hint">⌨ <kbd>Enter</kbd> = 提交（空输入也会算错并加入错题本）</div>
+          <div class="muted small spell-hint">⌨ <kbd>Enter</kbd> = 提交（空输入也会算错并加入错题本）${spellPass.started ? ` · 本词还要连续拼对 <b>${spellPass.remaining}</b> 次` : ''}</div>
         `}
       </div>
     `;
@@ -2629,19 +3182,39 @@
     const _playMain = $('#spellPlayMain');
     if (_playMain) _playMain.onclick = () => manualSpeak(w.word);
 
+    // v6.3：进度条旁的重置按钮（重置本范围的拼写进度，从头再拼）
+    const _spellResetInline = $('#spellResetInline');
+    if (_spellResetInline) _spellResetInline.onclick = (e) => { e.stopPropagation(); resetSpellProgress(); };
+
     const onCheck = () => {
       const v = $('#spellInput').value;
       // 空输入也算错：保证拼错就加入错题本
       const isRetry = state.spellAnswered && w._hasJudged;  // 是否"改正模式"提交
+      const ok = v.trim() !== '' && normalizeForCompare(v) === normalizeForCompare(w.word);
+      // v6.2：同一张卡结果不变时重复提交（例如对着已答对的卡再按 Enter）不重复计数
+      const changed = !w._judgedOnce || w._judgedOk !== ok;
+      w._judgedOnce = true;
+      w._judgedOk = ok;
       state.spellAnswered = true;
       w._hasJudged = true;
-      const ok = v.trim() !== '' && normalizeForCompare(v) === normalizeForCompare(w.word);
       w._lastOk = ok;
       w._userInput = v;
+      if (!changed) {
+        // 与上次判定一致 → 只刷新界面，不重复计分、不重复入错词本
+        renderSpellCard();
+        return;
+      }
       // 同步 SRS / 错词本
       if (ok) {
         nextReviewAfter(w.srs, true);
         w.srs.lastReviewed = Date.now();
+        // v6.2：通过规则 —— 第一次就拼对立即通过；拼错过则需连续拼对 2 次
+        const r = PassRule.hit('spell', w.key);
+        if (r.passed) {
+          purgeQueueTail('spell', w.key);            // 通过 → 清掉剩余队列里的重复卡
+        } else {
+          state.spellQueue.push(cloneCard(w));       // 还差 → 这个词重新排回队尾
+        }
         // 先回写 w.wrong 引用（如果是改正模式答对，要累计错题本累计值；如果是首次答对，状态也已经存在）
         if (!w.wrong) {
           w.wrong = state.wrongBook.find(x => x.word === w.word) || null;
@@ -2683,9 +3256,14 @@
             item.srs.lastReviewed = Date.now();
           }
         }
+        toast(r.passed
+          ? `「${w.word}」拼对，通过 ✓`
+          : `「${w.word}」拼对 ✓ · 已连续拼对 ${r.streak}/${r.need}，还要再拼对 ${r.remaining} 次`);
       } else {
         nextReviewAfter(w.srs, false);
         w.srs.lastReviewed = Date.now();
+        // v6.2：拼错一遍就进错词本，并把该词的要求提到「连续拼对 2 次」
+        const r = PassRule.miss('spell', w.key);
         // 进入错词本（首次错时新增，已存在则合并 sources）
         addToWrongBook(w.word, w.type, w.sourceBookId, w.meaning);
         // 关键修复：回写 w.wrong 引用，让"重答答对"时能累计 correctCount 直至毕业
@@ -2696,6 +3274,9 @@
           ensureSrs(w.wrong);
           nextReviewAfter(w.wrong.srs, false);
         }
+        // 同一张卡重新排回队尾：这个词本轮至少还要再被拼对 2 次
+        state.spellQueue.push(cloneCard(w));
+        toast(`「${w.word}」拼错，已加入错词本 · 还要再连续拼对 ${r.need} 次才算过`);
         // 同步单词本里的 srs
         for (const b of state.books) {
           const item = b.words.find(it => window.VocabData.normalizeKey(it.word) === w.key);
@@ -2713,18 +3294,22 @@
       const wasInRetry = !!w._inRetry;
       if (wasInRetry) w._inRetry = false;
       renderSpellCard();
-      if (wasInRetry && ok) {
-        toast(`✓ 改正成功 · 错词累计 ${w.wrong ? `${w.wrong.correctCount}/3 次` : '已记录'} · 按 Enter 下一题`);
+      if (wasInRetry) {
+        toast(ok ? '✓ 这次拼对了（已计入"连续拼对"次数）· 按 Enter 下一题' : '✗ 还是不对 · 正确答案已在下方，改正后再回车');
       }
     };
 
     const doSkip = () => {
-      // 跳过 = 算"标错"，进入错词本
+      // 跳过 = 算"标错"：进错词本，并同样要求「连续拼对 2 次」才通过
       state.spellAnswered = true;
       w._lastOk = false;
       w._userInput = '';
+      w._judgedOnce = true;
+      w._judgedOk = false;
+      PassRule.miss('spell', w.key);
       nextReviewAfter(w.srs, false);
       addToWrongBook(w.word, w.type, w.sourceBookId, w.meaning);
+      state.spellQueue.push(cloneCard(w));
       for (const b of state.books) {
         const item = b.words.find(it => window.VocabData.normalizeKey(it.word) === w.key);
         if (item) { ensureSrs(item); nextReviewAfter(item.srs, false); }
@@ -2741,6 +3326,8 @@
       // 新题没有改正模式
       const nextW = state.spellQueue[state.spellIndex];
       if (nextW) nextW._inRetry = false;
+      // v6.2：跳过已经通过的重复卡（通过后残留的副本）
+      skipPassedSpellCards();
       saveLastSpell();
       renderSpellCard();
     };
@@ -2956,6 +3543,14 @@
         else toast('请先选择单词本开始');
       };
     }
+    // v6.3：重置进度 —— 清空当前范围的听音进度（含连续认识计数），队列重建，从头再听
+    const resetBtn = $('#listenReset');
+    if (resetBtn) {
+      resetBtn.onclick = () => {
+        state.listenScope = picker.value || state.listenScope;
+        resetListenProgress();
+      };
+    }
 
     // 进度恢复提示
     if (state.lastListen && state.listenQueue.length === 0) {
@@ -3010,9 +3605,12 @@
       state.listenQueue = items;
       state.listenIndex = 0;
       state.listenAnswered = false;
+      // 全新一轮 → 计数清零
+      state._listenKnowCount = 0;
+      state._listenUnknowCount = 0;
     }
     state.listenLastDecision = null;
-    state.listenSource = scope;
+    state.listenSource = listenScopeLabel(scope); // v6.3：显示可读范围名（如《单词本》）而不是 book:b_xxx
     saveLastListen();
     // v6：音频由 renderListenCard 里的 syncCardAudio 统一负责（出现即播、换词即停）
     renderListenCard();
@@ -3032,24 +3630,46 @@
           <div style="font-size:48px;margin-bottom:12px">🎧</div>
           <h3 style="margin:0 0 8px">准备开始听音辨义</h3>
           <p class="muted">上方选择单词本 → 点「开始听音」即进入。<br>听音时只放声音，凭记忆选择认识 / 不认识。</p>
+          <div style="margin-top:14px">
+            <button class="btn ghost danger" id="listenResetIdle" type="button" title="重置当前范围的听音进度，队列重建">🔄 重置进度</button>
+          </div>
         </div>
       `;
+      const _idleReset = $('#listenResetIdle');
+      if (_idleReset) _idleReset.onclick = () => resetListenProgress();
       return;
     }
 
     const it = state.listenQueue[state.listenIndex];
     if (!it) {
       endCardAudio();
+      const stats = roundStats('listen', state.listenQueue);
       area.innerHTML = `
         <div class="card flashcard" style="text-align:center;padding:48px 24px">
           <div style="font-size:48px;margin-bottom:12px">🎉</div>
           <h3 style="margin:0 0 8px">本轮听音已完成</h3>
-          <p class="muted">认识 ${state._listenKnowCount || 0} · 不认识 ${state._listenUnknowCount || 0}</p>
-          <button class="btn primary" id="listenRestart" style="margin-top:14px">🔄 再来一轮</button>
+          <p class="muted">共 ${stats.total} 个 · 通过 <b style="color:var(--success)">${stats.passed}</b> · 待巩固 <b style="color:var(--danger)">${stats.pending}</b></p>
+          ${stats.pending ? `<p class="muted small">待巩固的词还要再连续认识 ${PASS_STREAK_AFTER_MISS} 次才算过，下次会再来找你。</p>` : ''}
+          <div style="margin-top:14px" class="row gap wrap">
+            <button class="btn primary" id="listenRestart">🔄 再来一轮</button>
+            <button class="btn ghost danger" id="listenResetDone" type="button" title="重置这个范围的听音进度（含已掌握标记），队列重建，从头再听">🔄 重置进度，重新听</button>
+          </div>
         </div>
       `;
+      const _doneReset = $('#listenResetDone');
+      if (_doneReset) _doneReset.onclick = () => resetListenProgress();
       const restartBtn = $('#listenRestart');
-      if (restartBtn) restartBtn.onclick = () => { state.listenIndex = 0; state._listenKnowCount = 0; state._listenUnknowCount = 0; state.listenAnswered = false; renderListenCard(); };
+      if (restartBtn) restartBtn.onclick = () => {
+        // 再来一轮：清掉本范围旧快照后按当前范围重建队列（未通过的词会再次出现）
+        state.listenIndex = 0;
+        state._listenKnowCount = 0;
+        state._listenUnknowCount = 0;
+        state.listenAnswered = false;
+        state.listenLastDecision = null;
+        state.lastListen = null;
+        if (state.listenScope && state.lastListenMap) delete state.lastListenMap[state.listenScope];
+        startListen();
+      };
       return;
     }
 
@@ -3057,6 +3677,8 @@
     const total = state.listenQueue.length;
     const cur = state.listenIndex + 1;
     const pct = (cur / total) * 100;
+    // v6.2：这个词是否处在「答错后需连续认识 2 次」的阶段
+    const listenPass = PassRule.info('listen', it.key);
     if (info) info.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
         <div>
@@ -3065,7 +3687,11 @@
         </div>
         <div class="muted small">认识 ${state._listenKnowCount || 0} · 不认识 ${state._listenUnknowCount || 0}</div>
       </div>
-      <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+      ${listenPass.started ? `<div style="font-size:13px;margin-top:4px;color:var(--danger)">⚠ 本词已答错 · 已连续认识 ${listenPass.streak}/${listenPass.need} · 还要再连续点「认识」<b>${listenPass.remaining}</b> 次才通过</div>` : ''}
+      <div class="progress-row" style="margin-top:8px">
+        <div class="progress-bar"><span style="width:${pct.toFixed(1)}%"></span></div>
+        <button class="btn ghost danger reset-inline" id="listenResetInline" type="button" title="重置这个范围的听音进度，从头再听">🔄 重置进度</button>
+      </div>
     `;
 
     const entry = it.entry || {};
@@ -3105,6 +3731,14 @@
             ${phoneticText ? `<div class="phonetic">/${escapeHtml(phoneticText)}/</div>` : ''}
             <div class="reveal-meaning">${correctMeaning ? escapeHtml(correctMeaning) : '<span class="muted">暂无释义 · 可在单词本里编辑这个词补充</span>'}</div>
             ${exampleText ? `<div class="example muted">例：${escapeHtml(exampleText)}</div>` : ''}
+            ${state.listenLastDecision === 'know' && !listenPass.started ? `
+              <div class="pass-ok-note" style="margin-top:8px"><span class="ok-text">✓ 认识，通过</span></div>
+            ` : ''}
+            ${listenPass.started ? `
+              <div class="pass-pending-note" style="margin-top:8px;font-size:13px">
+                ⚠ 本词已答错过 · 已连续认识 <b>${listenPass.streak}/${listenPass.need}</b>，还要再连续点「认识」<b>${listenPass.remaining}</b> 次才算过
+              </div>
+            ` : ''}
             ${state.listenLastDecision === 'know' ? `
               <div class="rejudge-row">
                 <span class="muted small">发现自己想错了？</span>
@@ -3121,7 +3755,7 @@
         </div>
       ` : `
         <div class="actions">
-          <button class="btn know" id="listenKnow" type="button">✓ 认识</button>
+          <button class="btn know" id="listenKnow" type="button">${listenPass.started ? `✓ 认识（还要连续答对 ${listenPass.remaining} 次）` : '✓ 认识'}</button>
           <button class="btn unknow" id="listenUnknow" type="button">不认识</button>
           <button class="btn ghost" id="listenSkip" type="button" title="跳过这题">跳过</button>
         </div>
@@ -3132,6 +3766,10 @@
     const playBtn = $('#listenPlayBtn');
     if (playBtn) playBtn.onclick = () => manualSpeak(it.word);
 
+    // v6.3：进度条旁的重置按钮（重置本范围的听音进度，从头再听）
+    const _listenResetInline = $('#listenResetInline');
+    if (_listenResetInline) _listenResetInline.onclick = (e) => { e.stopPropagation(); resetListenProgress(); };
+
     // v6：音频跟随词卡 —— 换一个词就停掉上一个、并自动朗读当前词
     syncCardAudio(it.word);
 
@@ -3139,15 +3777,18 @@
     const rejudge = $('#listenRejudgeUnknow');
     if (rejudge) {
       rejudge.onclick = () => {
-        // 把这次"认识"撤销，改判为不认识：撤销计数并加入错词本
+        // 把这次"认识"撤销，改判为不认识：撤销计数 + 进错词本 + 要求连续认识 2 次
         state._listenKnowCount = Math.max(0, (state._listenKnowCount || 0) - 1);
         state._listenUnknowCount = (state._listenUnknowCount || 0) + 1;
+        const r = PassRule.miss('listen', it.key);
         addToWrongBook(it.word, it.type, it.sourceBookId, it.meaning);
         state.listenLastDecision = 'unknow';
         // 答错时 SRS 重置：下一题复习更短
         nextReviewAfter(it.srs, false);
+        // 改判后这个词本轮还要再被连续答对 2 次 → 重新排回队尾
+        state.listenQueue.push(cloneCard(it));
         saveLastListen();
-        toast('已重判为「不认识」，已加入错词本');
+        toast(`已重判为「不认识」，已加入错词本 · 还要再连续认识 ${r.need} 次才算过`);
         renderListenCard();
       };
     }
@@ -3187,10 +3828,25 @@
       state._listenKnowCount = (state._listenKnowCount || 0) + 1;
       // SRS 累计
       nextReviewAfter(it.srs, true);
+      // v6.2：与背诵同一套规则 —— 第一次就认识即通过；答错过则需连续认识 2 次
+      const r = PassRule.hit('listen', it.key);
+      if (r.passed) {
+        // 通过 → 清掉剩余队列里这个词的重复卡
+        purgeQueueTail('listen', it.key);
+      } else {
+        // 还差 → 这个词重新排回队尾，本轮的稍后再听一次
+        state.listenQueue.push(cloneCard(it));
+        toast(`「${it.word}」已认识 ${r.streak}/${r.need} · 还要再连续答对 ${r.remaining} 次才通过`);
+      }
     } else {
       state._listenUnknowCount = (state._listenUnknowCount || 0) + 1;
+      // v6.2：答错一遍就进错词本，并把要求提到「连续认识 2 次」
+      const r = PassRule.miss('listen', it.key);
       addToWrongBook(it.word, it.type, it.sourceBookId, it.meaning);
       nextReviewAfter(it.srs, false);
+      // 重新排回队尾：这个词本轮至少还要再被答对 2 次
+      state.listenQueue.push(cloneCard(it));
+      toast(`「${it.word}」已加入错词本 · 之后需再连续认识 ${r.need} 次才算过`);
     }
     saveLastListen();
     renderListenCard();
@@ -3200,6 +3856,16 @@
     state.listenIndex++;
     state.listenAnswered = false;
     state.listenLastDecision = null;
+    // v6.2：跳过已经通过的重复卡（通过后残留的副本）
+    while (state.listenIndex < state.listenQueue.length) {
+      const c = state.listenQueue[state.listenIndex];
+      if (!c) { state.listenIndex++; continue; }
+      // 已通过 = 没有待完成的通过要求，且这个副本是"已答对"的重复卡
+      const p = PassRule.info('listen', c.key);
+      const isDup = state.listenQueue.slice(0, state.listenIndex).some(x => x && x.key === c.key);
+      if (!p.started && isDup && c._lastOk === true) { state.listenIndex++; continue; }
+      break;
+    }
     if (state.listenIndex >= state.listenQueue.length) {
       // 全部完成
       state.listenIndex = state.listenQueue.length;
@@ -3207,7 +3873,8 @@
       persist();
       renderListenCard();
       // 完成后回到听音本面板给个汇总
-      toast(`🎉 本轮听音完成：认识 ${state._listenKnowCount || 0} · 不认识 ${state._listenUnknowCount || 0}`);
+      const stats = roundStats('listen', state.listenQueue);
+      toast(`🎉 本轮听音完成：通过 ${stats.passed} · 待巩固 ${stats.pending}`);
       return;
     }
     saveLastListen();
@@ -3820,7 +4487,9 @@
         if (snap && Array.isArray(snap.queue)) snap.queue = snap.queue.filter(q => !same(q));
       });
     });
-    if (state.studyStreak) delete state.studyStreak[wordKey];
+    if (state.studyPass) delete state.studyPass[wordKey];
+    if (state.spellPass) delete state.spellPass[wordKey];
+    if (state.listenPass) delete state.listenPass[wordKey];
     if (state.studyIndex > state.studyQueue.length) state.studyIndex = state.studyQueue.length;
     if (state.spellIndex > state.spellQueue.length) state.spellIndex = state.spellQueue.length;
     if (state.listenIndex > state.listenQueue.length) state.listenIndex = state.listenQueue.length;
@@ -3915,6 +4584,7 @@
     bindHome();
     bindStudy();
     bindBooks();
+    bindLocalBackup();
     bindWrong();
     bindDict();
     bindEditModal();
@@ -3922,6 +4592,7 @@
     bindGlobalSpeak();
     bindAudioToggle();
     bindPrefs();
+    bindAudioDiag();
     updateParseHint();
     // 默认进背诵页，让用户能直接接着上次继续
     $all('.tab').forEach(t => t.classList.remove('active'));
@@ -3959,6 +4630,10 @@
       btn.textContent = state.audioMuted ? '🔇' : '🔊';
       btn.classList.toggle('off', !!state.audioMuted);
       btn.title = state.audioMuted ? '朗读已关闭 · 点击开启' : '朗读已开启 · 点击关闭';
+      // v6.6：同步静音提示条 + 诊断面板
+      const banner = $('#audioMuteBanner');
+      if (banner) banner.style.display = state.audioMuted ? 'block' : 'none';
+      if (typeof window.__reportAudioDiag === 'function') window.__reportAudioDiag();
     };
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -3997,6 +4672,69 @@
         toast(`🔊 自动朗读已${state.autoSpeak ? '开启' : '关闭'}`);
       }
     });
+  }
+
+  /* ---------- 12.6 音频诊断（v6.6） ---------- */
+  function bindAudioDiag() {
+    const testBtn = $('#audioTestBtn');
+    const resetBtn = $('#audioResetBtn');
+    const diag = $('#audioDiag');
+    const banner = $('#audioMuteBanner');
+    if (!diag) return;
+
+    const report = () => {
+      const sup = (typeof speechSynthesis !== 'undefined');
+      const voices = sup ? speechSynthesis.getVoices().length : 0;
+      let st = 'N/A';
+      try { st = sup ? ('speaking=' + speechSynthesis.speaking + ' / pending=' + speechSynthesis.pending + ' / paused=' + speechSynthesis.paused) : 'N/A'; } catch (e) {}
+      diag.textContent =
+        '浏览器支持语音合成：' + (sup ? '是' : '否（请用 Chrome / Edge / Safari）') + '\n' +
+        '已加载语音数量：' + voices + (voices === 0 ? '（语音尚未加载，稍候或刷新页面）' : '') + '\n' +
+        '朗读总开关（静音）：' + (state.audioMuted ? '已关闭 🔇' : '开启 🔊') + '\n' +
+        '自动朗读：' + (state.autoSpeak ? '开启' : '关闭（Ctrl/Cmd+Shift+S 切换）') + '\n' +
+        '当前合成引擎状态：' + st;
+    };
+    window.__reportAudioDiag = report;
+
+    if (testBtn) {
+      testBtn.addEventListener('click', () => {
+        report();
+        if (state.audioMuted) { toast('🔇 朗读已关闭，先点右上角 🔊 开启再测'); return; }
+        const t = 'This is a pronunciation test.';
+        try {
+          if ('speechSynthesis' in window) speechSynthesis.cancel();
+          Speech.speak(t);
+        } catch (e) {}
+        // 800ms 后看引擎是否真的开始播放
+        setTimeout(() => {
+          let ok = false;
+          try { ok = ('speechSynthesis' in window) && (speechSynthesis.speaking || speechSynthesis.pending); } catch (e) {}
+          diag.textContent += '\n测试结果：' + (ok
+            ? '✅ 引擎已开始朗读（若仍听不到声音，请检查系统音量 / 标签页是否被静音）'
+            : '❌ 引擎未开始播放 → 点「强制重置语音引擎」后再测；仍不行请重启浏览器');
+        }, 800);
+      });
+    }
+
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        try {
+          if ('speechSynthesis' in window) speechSynthesis.cancel();
+          // 触发一次"空朗读"唤醒被卡住的引擎（Chrome 常见 stuck）
+          const u = new SpeechSynthesisUtterance(' ');
+          u.volume = 0;
+          speechSynthesis.speak(u);
+          speechSynthesis.cancel();
+        } catch (e) {}
+        toast('♻ 已强制重置语音引擎');
+        setTimeout(report, 200);
+      });
+    }
+
+    // 暴露给顶部 🔊 开关，同步静音提示条
+    window.__syncAudioBanner = () => { if (banner) banner.style.display = state.audioMuted ? 'block' : 'none'; };
+
+    report();
   }
 
   document.addEventListener('DOMContentLoaded', init);

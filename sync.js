@@ -54,18 +54,29 @@
         throw e;
       }
     }
-    // 重建该书的 words（删除后插入，简化逻辑）
-    await window.SB.remove('vocab_words', { book_id: bid });
-    if (book.words && book.words.length) {
-      const rows = book.words.map(function (w) {
-        return {
-          book_id: bid, word: w.word, type: w.type || null,
-          meaning: w.meaning || null, example: w.example || null,
-          mastered: !!w.mastered, srs: w.srs || null,
-          added_at: fmtDate(w.addedAt) || fmtDate(Date.now())
-        };
-      });
-      await window.SB.insert('vocab_words', rows);
+    // v6.1：安全的单词同步 —— 先 upsert 写入/更新，再清理本地已删除的行
+    // 旧实现是「先 remove 整本再 insert」，同步窗口内该书在云端是空的；一旦中断就永久丢失
+    const rows = (book.words || []).map(function (w) {
+      return {
+        book_id: bid, word: w.word, type: w.type || null,
+        meaning: w.meaning || null, example: w.example || null,
+        mastered: !!w.mastered, srs: w.srs || null,
+        added_at: fmtDate(w.addedAt) || fmtDate(Date.now())
+      };
+    });
+    if (rows.length) {
+      await window.SB.upsertOn('vocab_words', rows, 'book_id,word');
+    }
+    // 清理云端多出来、本地已删除的行（这一步失败最多留脏数据，不会丢词）
+    try {
+      const remote = await window.SB.selectAll('vocab_words', '?book_id=eq.' + encodeURIComponent(bid) + '&select=word');
+      const localWords = new Set(rows.map(function (r) { return r.word; }));
+      const stale = remote.map(function (r) { return r.word; }).filter(function (w) { return w && !localWords.has(w); });
+      for (const w of stale) {
+        await window.SB.remove('vocab_words', { book_id: bid, word: w });
+      }
+    } catch (e) {
+      console.warn('SYNC: 清理多余单词失败（不影响已有数据）', e && e.message);
     }
   }
 
@@ -98,10 +109,12 @@
           updateProgress();
         });
       }));
-      // 检查是否有失败
+      // v6.1：单本书失败不再中断整条同步 —— 记录警告，继续推 wrong_book / user_state
       const bookFails = bookResults.filter(function (r) { return r.status === 'rejected'; });
+      let softError = '';
       if (bookFails.length) {
-        throw new Error(bookFails.length + ' 本书同步失败: ' + (bookFails[0].reason?.message || 'unknown'));
+        softError = bookFails.length + ' 本书同步失败: ' + (bookFails[0].reason && bookFails[0].reason.message || 'unknown');
+        console.warn('SYNC(partial): ' + softError);
       }
       // 应用 id 变更映射
       for (const book of books) {
@@ -115,8 +128,7 @@
         await Promise.all(toDelete.map(function (rb) { return window.SB.remove('vocab_books', { id: rb.id }); }));
       }
 
-      // 2) wrong_book
-      await window.SB.remove('wrong_book', { user_id: userId });
+      // 2) wrong_book（v6.1：同样改为 upsert 优先，避免中断即清空）
       if (s.wrongBook && s.wrongBook.length) {
         const rows = s.wrongBook.map(function (w) {
           return {
@@ -126,15 +138,38 @@
             last_seen: fmtDate(w.lastSeen)
           };
         });
-        await window.SB.insert('wrong_book', rows);
+        await window.SB.upsertOn('wrong_book', rows, 'user_id,word');
+      }
+      try {
+        const remoteWrong = await window.SB.selectAll('wrong_book', '?user_id=eq.' + userId + '&select=word');
+        const localWords = new Set((s.wrongBook || []).map(function (w) { return w.word; }));
+        for (const r of remoteWrong) {
+          if (r.word && !localWords.has(r.word)) {
+            await window.SB.remove('wrong_book', { user_id: userId, word: r.word });
+          }
+        }
+      } catch (e) {
+        console.warn('SYNC: 清理多余错词失败（不影响已有数据）', e && e.message);
       }
 
-      // 3) user_dict
-      await window.SB.remove('user_dict', { user_id: userId });
+      // 3) user_dict（v6.1：同样 upsert 优先）
       const dictRows = Object.entries(s.userDict || {}).map(function (e) {
         return { user_id: userId, word: e[0], entry: e[1] };
       });
-      if (dictRows.length) await window.SB.insert('user_dict', dictRows);
+      if (dictRows.length) {
+        await window.SB.upsertOn('user_dict', dictRows, 'user_id,word');
+      }
+      try {
+        const remoteDict = await window.SB.selectAll('user_dict', '?user_id=eq.' + userId + '&select=word');
+        const localWords = new Set(Object.keys(s.userDict || {}));
+        for (const r of remoteDict) {
+          if (r.word && !localWords.has(r.word)) {
+            await window.SB.remove('user_dict', { user_id: userId, word: r.word });
+          }
+        }
+      } catch (e) {
+        console.warn('SYNC: 清理多余词典条目失败（不影响已有数据）', e && e.message);
+      }
 
       // 4) user_state
       await window.SB.upsert('user_state', {
@@ -146,10 +181,16 @@
       }, 'user_id');
 
       const elapsed = Date.now() - startTs;
-      console.log('SYNC ok in ' + elapsed + 'ms');
+      console.log('SYNC ok in ' + elapsed + 'ms' + (softError ? '（含部分失败）' : ''));
       lastSync = Date.now();
-      lastError = null;
-      syncStatus = 'idle';
+      if (softError) {
+        // 部分失败：算成功（数据已尽量写入），但把警告透给用户
+        lastError = softError;
+        syncStatus = 'partial';
+      } else {
+        lastError = null;
+        syncStatus = 'idle';
+      }
     } catch (e) {
       console.error('SYNC failed:', e);
       lastError = (e && e.message) || String(e);

@@ -153,6 +153,30 @@
       return rest('POST', '/rest/v1/' + table, arr, { prefer: prefer });
     },
 
+    // v6.1：按 on_conflict 查询参数做真正的「冲突即更新」，用于 vocab_words(book_id,word) 复合主键
+    upsertOn: function (table, rows, conflictCols) {
+      const arr = Array.isArray(rows) ? rows : [rows];
+      const qs = conflictCols ? ('?on_conflict=' + encodeURIComponent(conflictCols)) : '';
+      return rest('POST', '/rest/v1/' + table + qs, arr, { prefer: 'resolution=merge-duplicates' });
+    },
+
+    // v6.1：分页拉取（每页 1000，避免 Supabase 默认上限截断）
+    selectAll: async function (table, query, cap) {
+      const cap_ = cap || 20000;
+      const out = [];
+      let offset = 0;
+      const pageSize = 1000;
+      while (offset < cap_) {
+        const sep = (query && query.indexOf('?') >= 0) ? '&' : '?';
+        const page = await rest('GET', '/rest/v1/' + table + (query || '') + sep + 'limit=' + pageSize + '&offset=' + offset);
+        const rows = Array.isArray(page) ? page : [];
+        out.push.apply(out, rows);
+        if (rows.length < pageSize) break;
+        offset += pageSize;
+      }
+      return out;
+    },
+
     update: function (table, match, patch) {
       const qs = Object.keys(match).map(function (k) { return k + '=eq.' + encodeURIComponent(match[k]); }).join('&');
       return rest('PATCH', '/rest/v1/' + table + '?' + qs, patch, { prefer: 'return=representation' });
