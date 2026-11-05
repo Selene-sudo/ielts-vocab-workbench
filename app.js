@@ -638,6 +638,8 @@
         document.removeEventListener('pointerdown', unlock, true);
         document.removeEventListener('touchstart', unlock, true);
         document.removeEventListener('keydown', unlock, true);
+        // v6.12：顺手解锁 <audio>（真人发音走 audio 元素，同样受自动播放策略约束）
+        try { PrAudio.prime(); } catch (e) {}
         // v6.9：首屏自动朗读常被拦截，手势到手后把当前词卡补读一次
         this._blocked = false;
         this._retryPending(isIOS ? 500 : 160);
@@ -705,7 +707,8 @@
           return;
         }
         this._lastSpokenText = '';   // 绕过 350ms 去重
-        this.speak(txt);
+        // v6.12：走统一入口（真人录音优先），不要退回纯 TTS
+        Say.speak(txt);
       };
       this._retryTimers.push(setTimeout(run, delay == null ? 200 : delay));
     },
@@ -945,6 +948,217 @@
   // 便于排查线上语音问题（不影响功能）
   window.__speech = Speech;
 
+  /* ---------- 1.6 真人发音（v6.12） ----------
+     浏览器自带的 speechSynthesis 在部分环境里会整块失效（无声、无回调、引擎卡死），
+     单词朗读改为优先播放真人录音，拉不到音频再退回浏览器朗读。
+     音源：Google 词典录音（英/美音）→ 有道词典发音。
+  */
+  const SILENT_WAV = 'data:audio/wav;base64,UklGRqQMAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YYAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+
+  const PrAudio = {
+    el: null,
+    ready: false,
+    _token: 0,
+    _blocked: false,     // 自动播放被拦（需要用户手势）
+    _failUntil: {},      // 坏链缓存：同一 URL 短时间内不再重试
+    _current: '',
+    lastSrc: '',
+    lastError: '',
+    lastStartedAt: 0,
+    playedCount: 0,
+    init() {
+      try {
+        const a = new Audio();
+        a.preload = 'auto';
+        this.el = a;
+        this.ready = true;
+      } catch (e) {
+        this.ready = false;
+      }
+    },
+    /** 只处理单词/短词组；句子交给浏览器朗读 */
+    canUse(text) {
+      const t = String(text || '').trim();
+      if (!this.ready || !t) return false;
+      if (t.length > 42) return false;
+      if (/[.!?,;:。，！？、]/.test(t)) return false;
+      if (t.split(/\s+/).length > 4) return false;
+      return /^[A-Za-z][A-Za-z'’\-\s]*$/.test(t);
+    },
+    _urls(t) {
+      const raw = t.trim().toLowerCase();
+      const q = encodeURIComponent(raw);
+      const slug = encodeURIComponent(raw.replace(/[^a-z'\- ]/g, '').replace(/\s+/g, '_'));
+      const base = 'https://ssl.gstatic.com/dictionary/static/sounds/20200429/';
+      return [
+        base + slug + '--_gb_1.mp3',                                   // Google 词典 · 英音
+        base + slug + '--_us_1.mp3',                                   // Google 词典 · 美音
+        'https://dict.youdao.com/dictvoice?audio=' + q + '&type=1',    // 有道 · 英音
+        'https://dict.youdao.com/dictvoice?audio=' + q + '&type=2'     // 有道 · 美音
+      ];
+    },
+    /** 用户手势解锁：放一段静音 wav，让浏览器记住"这个页面可以出声" */
+    prime() {
+      if (!this.ready) return;
+      try {
+        const a = new Audio(SILENT_WAV);
+        a.volume = 0;
+        const p = a.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) {}
+    },
+    stop() {
+      this._token++;
+      const a = this.el;
+      if (a) {
+        try { a.pause(); a.currentTime = 0; } catch (e) {}
+      }
+      this._current = '';
+    },
+    play(text) {
+      const t = String(text || '').trim();
+      if (!this.ready || !t) return Promise.resolve(false);
+      // v6.12：先停掉上一段，避免两次触发叠在一起
+      try {
+        if (this.el && !this.el.paused) { this.el.pause(); this.el.currentTime = 0; }
+      } catch (e) {}
+      const token = ++this._token;
+      this._current = t;
+      this._blocked = false;
+
+      return new Promise(resolve => {
+        const urls = this._urls(t);
+        let i = 0;
+        let done = false;
+
+        const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+
+        const tryNext = () => {
+          if (done) return;
+          if (token !== this._token) return finish(false);   // 已经被换词打断
+          if (i >= urls.length) {
+            if (!this.lastError) this.lastError = 'no-audio';
+            return finish(false);
+          }
+          const url = urls[i++];
+          if (this._failUntil[url] && this._failUntil[url] > Date.now()) return tryNext();
+
+          const a = new Audio();
+          this.el = a;
+          let settled = false;
+          let timer = null;
+
+          const fail = (why) => {
+            if (settled || done) return;
+            settled = true;
+            clearTimeout(timer);
+            try { a.pause(); } catch (e) {}
+            this.lastError = why;
+            if (why !== 'blocked') this._failUntil[url] = Date.now() + 60000;
+            if (why === 'blocked' || why === 'NotAllowedError') {
+              // 自动播放被拦：整条链都别试了，等用户点一下
+              this._blocked = true;
+              return finish(false);
+            }
+            tryNext();
+          };
+
+          const ok = () => {
+            if (settled || done) return;
+            settled = true;
+            clearTimeout(timer);
+            this.lastSrc = url;
+            this.lastError = '';
+            this.lastStartedAt = Date.now();
+            this.playedCount++;
+            finish(true);
+          };
+
+          timer = setTimeout(() => fail('timeout'), 3500);
+          a.addEventListener('playing', ok, { once: true });
+          a.addEventListener('error', () => fail('error'), { once: true });
+          a.addEventListener('ended', () => { this._current = ''; }, { once: true });
+          a.volume = 1;
+          a.src = url;
+          const p = a.play();
+          if (p && p.catch) p.catch(err => fail((err && err.name) || 'play-rejected'));
+        };
+
+        tryNext();
+      });
+    }
+  };
+  PrAudio.init();
+  window.__prAudio = PrAudio;
+
+  /** 统一发音入口：单词走真人录音，句子走浏览器朗读 */
+  const Say = {
+    _pending: '',
+    _armed: false,
+    _lastText: '',
+    _lastAt: 0,
+    blocked: false,
+    speak(text) {
+      const t = String(text || '').trim();
+      if (!t || state.audioMuted) return;
+      const now = Date.now();
+      if (t === this._lastText && now - this._lastAt < 300) return;
+      this._lastText = t;
+      this._lastAt = now;
+      this._pending = t;
+      Speech._pendingText = t;   // 让 Speech 自己的手势恢复也能补读
+
+      if (PrAudio.canUse(t)) {
+        PrAudio.play(t).then(ok => {
+          if (ok) { this.blocked = false; Speech._blocked = false; return; }
+          if (state.audioMuted) return;
+          if (PrAudio._blocked) {
+            // 真人音频被自动播放策略拦下 → 等一次点击再补读（不要接着试 TTS，同样会被拦）
+            this.blocked = true;
+            this._armGestureRetry();
+            return;
+          }
+          // 拉不到音频（离线/没录音）→ 退回浏览器朗读
+          Speech.speak(t);
+        });
+        return;
+      }
+      Speech.speak(t);
+    },
+    /** 用户主动点 🔊：也走同一条链路，但被拦时要给出提示 */
+    manual(text) {
+      if (state.audioMuted) {
+        toast('🔇 朗读已关闭 · 点顶部 🔊 可重新开启');
+        return;
+      }
+      this._lastText = '';
+      this.speak(text);
+    },
+    stop() {
+      PrAudio.stop();
+      Speech.stop();
+    },
+    _armGestureRetry() {
+      if (this._armed) return;
+      this._armed = true;
+      const resume = () => {
+        document.removeEventListener('pointerdown', resume, true);
+        document.removeEventListener('touchstart', resume, true);
+        document.removeEventListener('keydown', resume, true);
+        this._armed = false;
+        this.blocked = false;
+        PrAudio._blocked = false;
+        Speech._blocked = false;
+        const t = this._pending;
+        if (t && !state.audioMuted) setTimeout(() => this.speak(t), 150);
+      };
+      document.addEventListener('pointerdown', resume, true);
+      document.addEventListener('touchstart', resume, true);
+      document.addEventListener('keydown', resume, true);
+    }
+  };
+  window.__say = Say;
+
   /**
    * v6：把音频和「词卡生命周期」绑在一起
    *  - 卡片换词（上一张消失 / 这一张出现）→ 停掉上一张的音频
@@ -955,27 +1169,23 @@
     const o = opts || {};
     const key = String(word || '').trim();
     if (Speech._cardKey !== key) {
-      Speech.stop();
+      Say.stop();
       Speech._cardKey = key || null;
     }
     if (!key || o.silent) return;
     if (!state.autoSpeak || state.audioMuted) return;
-    try { Speech.speak(key); } catch (e) {}
+    try { Say.speak(key); } catch (e) {}
   }
 
   /** v6：卡片区域没词了（空态 / 本轮完成）→ 立刻停声 */
   function endCardAudio() {
-    Speech.stop();
+    Say.stop();
     Speech._cardKey = null;
   }
 
   /** v6：用户主动点 🔊 播放（静音时给个提示，避免"点了没反应"的错觉） */
   function manualSpeak(text) {
-    if (state.audioMuted) {
-      toast('🔇 朗读已关闭 · 点顶部 🔊 可重新开启');
-      return;
-    }
-    try { Speech.speak(text); } catch (e) {}
+    try { Say.manual(text); } catch (e) {}
   }
 
   /* ---------- 2. Tab 切换 ---------- */
@@ -4839,12 +5049,14 @@
       e.stopPropagation();
       state.audioMuted = !state.audioMuted;
       if (state.audioMuted) {
-        Speech.stop();
+        Say.stop();
         toast('🔇 朗读音频已关闭');
       } else {
         Speech.setMuted(false);
+        PrAudio._blocked = false;
+        Say.blocked = false;
         toast('🔊 朗读音频已开启');
-        try { Speech.speak('audio on'); } catch (err) {}
+        try { Say.speak('audio'); } catch (err) {}
       }
       persist();
       syncUI();
@@ -4867,7 +5079,7 @@
       // Ctrl/Cmd + Shift + S = 切换自动朗读
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 's') {
         state.autoSpeak = !state.autoSpeak;
-        if (!state.autoSpeak) Speech.stop();
+        if (!state.autoSpeak) Say.stop();
         persist();
         toast(`🔊 自动朗读已${state.autoSpeak ? '开启' : '关闭'}`);
       }
@@ -4901,9 +5113,14 @@
     if (banner) banner.style.display = 'none';
     persist();
 
+    PrAudio._blocked = false;
+    Say.blocked = false;
+    PrAudio._failUntil = {};
+    PrAudio._token++;
+
     const text = Speech._cardKey || Speech._pendingText || 'audio check';
-    // 让 cancel 的竞态先过去，再重新朗读
-    setTimeout(() => { try { Speech.speak(text); } catch (e) {} }, 320);
+    // 让 cancel 的竞态先过去，再重新朗读（真人录音优先）
+    setTimeout(() => { try { Say.speak(text); } catch (e) {} }, 320);
     toast('🔊 已复位语音设置，正在重读：' + text);
 
     // v6.11：只有「引擎队列为空 且 没有任何开始回调」才算真卡死。
@@ -4929,6 +5146,7 @@
     const diag = $('#audioDiag');
     const banner = $('#audioMuteBanner');
     if (!diag) return;
+    let testMsg = '';   // v6.12：测试结果要能留在面板里，不能被 2s 自动刷新冲掉
 
     const report = () => {
       const sup = (typeof speechSynthesis !== 'undefined');
@@ -4936,17 +5154,34 @@
       let st = 'N/A';
       try { st = sup ? ('speaking=' + speechSynthesis.speaking + ' / pending=' + speechSynthesis.pending + ' / paused=' + speechSynthesis.paused) : 'N/A'; } catch (e) {}
       const v = Speech.preferredVoice;
+      let elState = '未初始化';
+      try {
+        if (PrAudio.el) {
+          elState = '已播放 ' + PrAudio.el.currentTime.toFixed(1) + ' 秒 · ' +
+            (PrAudio.el.paused ? '当前暂停' : '正在播放') +
+            ' · 音量 ' + Math.round(PrAudio.el.volume * 100) + '%';
+        }
+      } catch (e) {}
+      const srcName = PrAudio.lastSrc
+        ? (PrAudio.lastSrc.indexOf('gstatic') >= 0 ? 'Google 词典真人录音' : '有道词典发音')
+        : '无';
       diag.textContent =
-        '浏览器支持语音合成：' + (sup ? '是' : '否（请用 Chrome / Edge / Safari）') + '\n' +
-        '已加载语音数量：' + voices + (voices === 0 ? '（语音尚未加载，稍候或刷新页面）' : '') + '\n' +
-        '当前发音人：' + (v ? v.name + '（' + v.lang + ' · ' + (v.localService === false ? '需联网' : '本地') + '）' : '浏览器默认') + '\n' +
+        '发音方式：真人录音优先（拉不到音频才用浏览器朗读）\n' +
+        '最近一次播放来源：' + srcName + '\n' +
+        '音频元素：' + elState + '\n' +
+        '音频播放次数：' + PrAudio.playedCount + ' 次\n' +
+        '音频出错：' + (PrAudio.lastError || '无') + '\n' +
+        '—— 以下是浏览器朗读（备用）——\n' +
+        '支持语音合成：' + (sup ? '是' : '否（请用 Chrome / Edge / Safari）') + '\n' +
+        '已加载语音数量：' + voices + (voices === 0 ? '（未加载）' : '') + '\n' +
+        '当前发音人：' + (v ? v.name + '（' + v.lang + '）' : '浏览器默认') + '\n' +
         '朗读总开关（静音）：' + (state.audioMuted ? '已关闭 🔇' : '开启 🔊') + '\n' +
-        '自动播放拦截：' + (Speech._blocked ? '⚠️ 是（浏览器要求先点一下页面，点任意处会自动恢复）' : '否') + '\n' +
+        '自动播放拦截：' + ((Speech._blocked || PrAudio._blocked) ? '⚠️ 是（浏览器要求先点一下页面，点任意处会自动恢复）' : '否') + '\n' +
         '自动朗读：' + (state.autoSpeak ? '开启' : '关闭（Ctrl/Cmd+Shift+S 切换）') + '\n' +
-        '最近一次错误：' + (Speech._lastError || '无') + '\n' +
         '最近一次朗读：' + (Speech._lastResult || '还没朗读过') + '\n' +
-        (Speech._engineDead ? '⚠️ 语音引擎没有响应：先彻底退出浏览器重开；仍不行请到 macOS「系统设置 → 辅助功能 → 朗读内容」确认已安装英文语音\n' : '') +
-        '当前合成引擎状态：' + st;
+        (Speech._engineDead ? '⚠️ 浏览器朗读引擎没有响应（真人录音不受影响）\n' : '') +
+        '合成引擎状态：' + st +
+        (testMsg ? '\n\n测试结果：' + testMsg : '');
     };
     window.__reportAudioDiag = report;
 
@@ -4970,22 +5205,32 @@
       testBtn.addEventListener('click', () => {
         report();
         if (state.audioMuted) { toast('🔇 朗读已关闭，先点右上角 🔊 开启再测'); return; }
-        const t = 'This is a pronunciation test.';
-        try {
-          if ('speechSynthesis' in window) speechSynthesis.cancel();
-          Speech._cancelAt = Date.now();
-          Speech._blocked = false;
-          Speech._lastSpokenText = '';
-          Speech.speak(t);
-        } catch (e) {}
-        // 2.6s 后看引擎是否真的开始播放（1.6s 内的重试也算在内）
-        setTimeout(() => {
-          let ok = false;
-          try { ok = ('speechSynthesis' in window) && (speechSynthesis.speaking || speechSynthesis.pending); } catch (e) {}
-          diag.textContent += '\n测试结果：' + (ok
-            ? '✅ 引擎已接受朗读（若仍听不到声音，请检查系统音量 / 标签页是否被静音 / 输出设备）'
-            : '❌ 引擎未开始播放 → 点「强制重置语音引擎」后再测；仍不行请彻底退出浏览器重开');
-        }, 2600);
+        // v6.12：测试走真人音频。只要 currentTime 在推进，就说明声音真的送出去了；
+        // 此时还听不到，问题一定在标签页静音 / 系统输出的路上，而不是网站。
+        PrAudio._blocked = false;
+        PrAudio._failUntil = {};
+        Speech._blocked = false;
+        PrAudio.stop();
+        const word = (Speech._cardKey || 'apple').trim();
+        PrAudio.play(word).then(ok => {
+          setTimeout(() => {
+            let sec = 0, paused = true;
+            try { sec = PrAudio.el ? PrAudio.el.currentTime : 0; paused = PrAudio.el ? PrAudio.el.paused : true; } catch (e) {}
+            let msg;
+            if (ok && sec > 0) {
+              msg = '✅ 声音已经播出去了（"' + word + '" 播放到第 ' + sec.toFixed(1) + ' 秒）。' +
+                    '如果你还是听不到，那就是浏览器标签页被静音，或系统输出设备不对 —— 不是网站的问题。' +
+                    '\n请检查：① 右键标签页看是否勾选了「将网站静音」；② macOS 右上角控制中心的声音输出设备；③ 键盘音量键。';
+            } else if (ok) {
+              msg = '⚠️ 音频已加载但播放进度没动，请在页面上点一下再测一次。';
+            } else {
+              msg = '❌ 真人音频也没能播放（' + (PrAudio.lastError || '未知原因') + '）。' +
+                    '通常是网络取不到音频，或浏览器的自动播放被禁用。';
+            }
+            testMsg = msg;
+            report();
+          }, 1200);
+        });
       });
     }
 
@@ -5003,6 +5248,10 @@
         Speech._voiceIdx = 0;
         Speech._engineDead = false;
         Speech._lastError = '';
+        PrAudio._blocked = false;
+        PrAudio._failUntil = {};
+        Say.blocked = false;
+        testMsg = '';
         Speech._lastSpokenText = '';
         Speech._cancelAt = Date.now();
         setTimeout(() => { try { Speech.speak('engine ready'); } catch (e) {} }, 180);
