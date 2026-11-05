@@ -13,7 +13,7 @@
   <meta property="og:site_name" content="VocabMaster" />
   <meta name="twitter:card" content="summary_large_image" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230f5a52'/%3E%3Ctext x='32' y='43' font-family='Georgia,serif' font-size='30' font-weight='700' fill='%23f4f1e9' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=6.9" data-page-node-id="uxAwwmawcJrJgnd1Zyc4X1" />
+  <link rel="stylesheet" href="styles.css?v=6.10" data-page-node-id="uxAwwmawcJrJgnd1Zyc4X1" />
 </head>
 <body data-page-node-id="DLlBgq9Eh76QuExUifuECW">
   <div id="app" data-page-node-id="mMAB3AbdKZM0KBSVUMLEXT">
@@ -99,6 +99,7 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
           <div class="row gap" data-page-node-id="OxKJxniVDbDtSD1b0b9tlL">
             <select id="studyBookSelect" class="select" data-page-node-id="INkAByxzPc10yPIcERmFO1"></select>
             <button class="btn ghost danger" id="restartBook" title="清空这本的已掌握标记与连续计数，从头再背一遍" data-page-node-id="8hL1BuPf6JOGIik1Zx1rW4">🔄 重置进度</button>
+            <button class="btn ghost" id="studyRepairAudio" title="朗读没声音时点这里：复位静音与自动朗读，并重读当前单词">🛠 修复语音</button>
           </div>
         </div>
 
@@ -200,6 +201,7 @@ I decided to give up smoking.#我决定戒烟。"></textarea>
               <p class="muted small" style="margin:0">朗读没声音时：先点「测试朗读」看引擎是否出声；若仍无声，点「强制重置语音引擎」可解除 Chrome 常见的"卡死"状态；再不行就重启浏览器或检查系统/标签页是否被静音。下方实时显示当前音频状态。</p>
             </div>
             <div class="row gap wrap" style="align-items:center">
+              <button class="btn" id="audioRepairBtn">🛠 一键修复语音</button>
               <button class="btn ghost" id="audioTestBtn">🔊 测试朗读</button>
               <button class="btn ghost" id="audioResetBtn">♻ 强制重置语音引擎</button>
             </div>
@@ -396,9 +398,9 @@ apply | v. 申请,应用
     </div>
   </div>
 
-  <script src="data.js?v=6.9"></script>
-  <script src="supabase.js?v=6.9"></script>
-  <script src="sync.js?v=6.9"></script>
-  <script src="app.js?v=6.9"></script>
+  <script src="data.js?v=6.10"></script>
+  <script src="supabase.js?v=6.10"></script>
+  <script src="sync.js?v=6.10"></script>
+  <script src="app.js?v=6.10"></script>
 </body>
 </html>

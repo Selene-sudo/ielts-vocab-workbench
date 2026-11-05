@@ -551,6 +551,11 @@
     _blocked: false,       // 是否被自动播放策略拦截
     _recoverCount: 0,      // 自动恢复次数上限，避免死循环
     _gestureArmed: false,  // 是否已挂上"下一次点击即恢复"的监听
+    _keepAlive: [],        // v6.10：持有 utterance 引用，防止被 GC 导致播到一半断掉
+    _candidates: [],       // v6.10：发音人候补链（主发音人失败时换人）
+    _voiceIdx: 0,
+    _lastError: '',        // v6.10：最近一次错误码，供诊断面板显示
+    _engineDead: false,    // v6.10：引擎完全无响应（需重启浏览器）
     init() {
       if (!('speechSynthesis' in window)) {
         this.supported = false;
@@ -580,6 +585,14 @@
         if (!this.preferredVoice) {
           this.preferredVoice = this.voices.find(x => /^en/i.test(x.lang)) || this.voices[0];
         }
+        // v6.10：候补链 —— 主发音人失败时先试 null（让浏览器用默认发音人），再退回其它英文音
+        const list = [];
+        if (this.preferredVoice) list.push(this.preferredVoice);
+        list.push(null);
+        this.voices.filter(v => /^en/i.test(v.lang) && v.localService !== false && v !== this.preferredVoice)
+          .slice(0, 3).forEach(v => list.push(v));
+        this._candidates = list;
+        this._voiceIdx = 0;
         return true;
       };
 
@@ -644,7 +657,12 @@
     },
     /** v6：停掉当前朗读（词卡消失 / 静音 / 切页时调用） */
     stop() {
-      try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) {}
+      // v6.10：只在真的有内容在播时才 cancel —— 每次换卡都无条件 cancel 会把 Chrome 引擎搞坏
+      try {
+        if ('speechSynthesis' in window && (speechSynthesis.speaking || speechSynthesis.pending)) {
+          speechSynthesis.cancel();
+        }
+      } catch (e) {}
       this._cancelAt = Date.now();   // v6.9：记录取消时刻，speak 时避开竞态
       this._speaking = false;
       this._pendingSince = 0;
@@ -744,7 +762,10 @@
         u.pitch = 1;
         u.volume = 1;
         // 即便 voice.lang 不是 en-GB，也保留 lang 字段，让浏览器走英国口音模型
-        if (this.preferredVoice) u.voice = this.preferredVoice;
+        const cand = (this._candidates && this._candidates.length)
+          ? this._candidates[Math.min(this._voiceIdx, this._candidates.length - 1)]
+          : this.preferredVoice;
+        if (cand) { u.voice = cand; u.lang = cand.lang || 'en-GB'; }
         return u;
       };
 
@@ -759,20 +780,30 @@
           }
           const u = buildUtterance();
           let started = false;
+          // v6.10：必须持有引用。Chrome 会回收只被局部引用的 utterance，导致播到一半静音
+          this._keepAlive.push(u);
+          if (this._keepAlive.length > 10) this._keepAlive.shift();
+          const release = () => { this._keepAlive = this._keepAlive.filter(x => x !== u); };
           u.onstart = () => {
             started = true;
             this._speaking = true;
             this._pendingSince = 0;
             this._blocked = false;
             this._recoverCount = 0;
+            this._voiceIdx = 0;
+            this._lastError = '';
+            this._engineDead = false;
+            try { document.dispatchEvent(new CustomEvent('sb-speech-start')); } catch (e) {}
             this._startWatchdog();
           };
-          u.onend = () => { this._speaking = false; this._stopWatchdog(); };
+          u.onend = () => { this._speaking = false; this._stopWatchdog(); release(); };
           u.onerror = (ev) => {
             this._speaking = false;
             this._stopWatchdog();
+            release();
             // 'canceled' / 'interrupted' 不算错误
             if (ev && (ev.error === 'canceled' || ev.error === 'interrupted')) return;
+            this._lastError = (ev && ev.error) || 'unknown';
             // v6.9：被自动播放策略拦下（没用户手势）—— 重试没有意义，等下一次交互再补读
             if (ev && ev.error === 'not-allowed') {
               this._blocked = true;
@@ -782,6 +813,11 @@
               return;
             }
             console.warn('[speech] error', ev);
+            // v6.10：合成失败多半是发音人不可用 → 换下一个发音人再试
+            if (this._candidates && this._voiceIdx < this._candidates.length - 1) {
+              this._voiceIdx++;
+              console.warn('[speech] 切换发音人 →', this._voiceIdx);
+            }
             // v6：真错误（如 synthesis-failed / audio-busy）→ 换一条 utterance 再试
             if ((attempt || 0) < 2) {
               const t2 = setTimeout(() => trySpeak((attempt || 0) + 1), 180);
@@ -4765,9 +4801,54 @@
   }
 
   /* ---------- 12.6 音频诊断（v6.6） ---------- */
+  /**
+   * v6.10：一键修复 —— 把可能被关掉的开关全部复位，并立刻重读当前词。
+   * 覆盖用户最容易踩的三种"没声"：被静音、自动朗读被关、引擎卡死。
+   */
+  function repairAudio() {
+    state.audioMuted = false;
+    state.autoSpeak = true;
+    Speech.setMuted(false);
+    Speech._blocked = false;
+    Speech._voiceIdx = 0;
+    Speech._recoverCount = 0;
+    Speech._lastSpokenText = '';
+    Speech._clearTimers();
+    try { speechSynthesis.cancel(); } catch (e) {}
+    try { speechSynthesis.resume(); } catch (e) {}
+
+    const btn = $('#audioToggle');
+    if (btn) {
+      btn.textContent = '🔊';
+      btn.classList.remove('off');
+      btn.title = '朗读已开启 · 点击关闭';
+    }
+    const banner = $('#audioMuteBanner');
+    if (banner) banner.style.display = 'none';
+    persist();
+
+    const text = Speech._cardKey || Speech._pendingText || 'audio check';
+    // 让 cancel 的竞态先过去，再重新朗读
+    setTimeout(() => { try { Speech.speak(text); } catch (e) {} }, 320);
+    toast('🔊 已复位语音设置，正在重读：' + text);
+
+    // v6.10：1.8s 内引擎没有任何"开始播报"的回执 → 判定引擎卡死，给出明确结论
+    let started = false;
+    const onStart = () => { started = true; };
+    document.addEventListener('sb-speech-start', onStart);
+    setTimeout(() => {
+      document.removeEventListener('sb-speech-start', onStart);
+      if (started || Speech._blocked || !Speech.supported) return;
+      Speech._engineDead = true;
+      toast('⚠️ 浏览器语音引擎无响应 · 请重启浏览器（关掉所有窗口再打开）');
+      if (typeof window.__reportAudioDiag === 'function') window.__reportAudioDiag();
+    }, 1800);
+  }
+
   function bindAudioDiag() {
     const testBtn = $('#audioTestBtn');
     const resetBtn = $('#audioResetBtn');
+    const repairBtn = $('#audioRepairBtn');
     const diag = $('#audioDiag');
     const banner = $('#audioMuteBanner');
     if (!diag) return;
@@ -4777,15 +4858,35 @@
       const voices = sup ? speechSynthesis.getVoices().length : 0;
       let st = 'N/A';
       try { st = sup ? ('speaking=' + speechSynthesis.speaking + ' / pending=' + speechSynthesis.pending + ' / paused=' + speechSynthesis.paused) : 'N/A'; } catch (e) {}
+      const v = Speech.preferredVoice;
       diag.textContent =
         '浏览器支持语音合成：' + (sup ? '是' : '否（请用 Chrome / Edge / Safari）') + '\n' +
         '已加载语音数量：' + voices + (voices === 0 ? '（语音尚未加载，稍候或刷新页面）' : '') + '\n' +
+        '当前发音人：' + (v ? v.name + '（' + v.lang + ' · ' + (v.localService === false ? '需联网' : '本地') + '）' : '浏览器默认') + '\n' +
         '朗读总开关（静音）：' + (state.audioMuted ? '已关闭 🔇' : '开启 🔊') + '\n' +
         '自动播放拦截：' + (Speech._blocked ? '⚠️ 是（浏览器要求先点一下页面，点任意处会自动恢复）' : '否') + '\n' +
         '自动朗读：' + (state.autoSpeak ? '开启' : '关闭（Ctrl/Cmd+Shift+S 切换）') + '\n' +
+        '最近一次错误：' + (Speech._lastError || '无') + '\n' +
+        (Speech._engineDead ? '⚠️ 语音引擎无响应：代码已无法恢复，请彻底退出浏览器后重开（这不是网站问题）\n' : '') +
         '当前合成引擎状态：' + st;
     };
     window.__reportAudioDiag = report;
+
+    if (repairBtn) {
+      repairBtn.addEventListener('click', () => {
+        repairAudio();
+        setTimeout(report, 400);
+      });
+    }
+    // 背诵页工具条上的快捷入口：不用翻到单词本页也能修
+    const studyRepair = $('#studyRepairAudio');
+    if (studyRepair) {
+      studyRepair.addEventListener('click', (e) => {
+        e.stopPropagation();
+        repairAudio();
+        setTimeout(report, 400);
+      });
+    }
 
     if (testBtn) {
       testBtn.addEventListener('click', () => {
