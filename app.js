@@ -544,6 +544,13 @@
     _watchdog: null,       // v6：Chrome 长句会被"卡住"，定时 resume
     _unlocked: false,      // v6：iOS/Safari 需要一次用户手势解锁
     _retryTimers: [],
+    // v6.9：自动播放被浏览器拦截（not-allowed）后的恢复链路
+    _cancelAt: 0,          // 上次 cancel 的时间，避免 cancel→speak 同帧竞态被吞
+    _pendingSince: 0,      // 本次请求朗读的起始时间（用于判断"一直没开始"）
+    _pendingText: '',      // 最近一次想读的文本，供手势恢复/看门狗补播
+    _blocked: false,       // 是否被自动播放策略拦截
+    _recoverCount: 0,      // 自动恢复次数上限，避免死循环
+    _gestureArmed: false,  // 是否已挂上"下一次点击即恢复"的监听
     init() {
       if (!('speechSynthesis' in window)) {
         this.supported = false;
@@ -601,6 +608,9 @@
         document.removeEventListener('pointerdown', unlock, true);
         document.removeEventListener('touchstart', unlock, true);
         document.removeEventListener('keydown', unlock, true);
+        // v6.9：首屏自动朗读常被拦截，手势到手后把当前词卡补读一次
+        this._blocked = false;
+        this._retryPending(260);
       };
       document.addEventListener('pointerdown', unlock, true);
       document.addEventListener('touchstart', unlock, true);
@@ -635,13 +645,62 @@
     /** v6：停掉当前朗读（词卡消失 / 静音 / 切页时调用） */
     stop() {
       try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch (e) {}
+      this._cancelAt = Date.now();   // v6.9：记录取消时刻，speak 时避开竞态
       this._speaking = false;
+      this._pendingSince = 0;
       this._clearTimers();
       this._stopWatchdog();
     },
     setMuted(flag) {
       this.muted = !!flag;
       if (this.muted) this.stop();
+      else this._blocked = false;
+    },
+    /** v6.9：若当前有该读而未读的内容，稍后补读一次（手势解锁后调用） */
+    _retryPending(delay) {
+      const txt = this._pendingText;
+      if (!txt || this.muted) return;
+      const run = () => {
+        if (this.muted) return;
+        let busy = false;
+        try { busy = speechSynthesis.speaking || speechSynthesis.pending; } catch (e) {}
+        if (busy) return;            // 已经在读了，别打断
+        this._blocked = false;
+        this._lastSpokenText = '';   // 绕过 350ms 去重
+        this.speak(txt);
+      };
+      this._retryTimers.push(setTimeout(run, delay == null ? 200 : delay));
+    },
+    /**
+     * v6.9：被自动播放策略拦下后，挂一个一次性的"下一次交互即恢复"监听。
+     * 这是 Chrome/Edge 的硬限制：没有用户手势时 speak() 直接报 not-allowed。
+     */
+    _armGestureRetry() {
+      if (this._gestureArmed) return;
+      this._gestureArmed = true;
+      // 只提示一次，避免每次开页都弹
+      if (!this._blockedNoticeShown) {
+        this._blockedNoticeShown = true;
+        try { toast('🔈 浏览器暂未允许自动朗读 · 点一下页面即可恢复'); } catch (e) {}
+      }
+      setTimeout(() => {
+        if (typeof window.__reportAudioDiag === 'function') window.__reportAudioDiag();
+      }, 120);
+      const resume = () => {
+        document.removeEventListener('pointerdown', resume, true);
+        document.removeEventListener('touchstart', resume, true);
+        document.removeEventListener('keydown', resume, true);
+        this._gestureArmed = false;
+        this._blocked = false;
+        this._recoverCount = 0;
+        this._retryPending(180);
+        setTimeout(() => {
+          if (typeof window.__reportAudioDiag === 'function') window.__reportAudioDiag();
+        }, 700);
+      };
+      document.addEventListener('pointerdown', resume, true);
+      document.addEventListener('touchstart', resume, true);
+      document.addEventListener('keydown', resume, true);
     },
     _clearTimers() {
       (this._retryTimers || []).forEach(t => clearTimeout(t));
@@ -674,6 +733,9 @@
       if (t === this._lastSpokenText && now - this._lastSpeakAt < 350) return;
       this._lastSpokenText = t;
       this._lastSpeakAt = now;
+      this._pendingText = t;   // v6.9：记住待读文本，供手势恢复 / 看门狗补播
+      // 已被自动播放策略拦截 → 不再徒劳重试，等用户下一次交互
+      if (this._blocked) { this._armGestureRetry(); return; }
 
       const buildUtterance = () => {
         const u = new SpeechSynthesisUtterance(t);
@@ -697,13 +759,28 @@
           }
           const u = buildUtterance();
           let started = false;
-          u.onstart = () => { started = true; this._speaking = true; this._startWatchdog(); };
+          u.onstart = () => {
+            started = true;
+            this._speaking = true;
+            this._pendingSince = 0;
+            this._blocked = false;
+            this._recoverCount = 0;
+            this._startWatchdog();
+          };
           u.onend = () => { this._speaking = false; this._stopWatchdog(); };
           u.onerror = (ev) => {
             this._speaking = false;
             this._stopWatchdog();
             // 'canceled' / 'interrupted' 不算错误
             if (ev && (ev.error === 'canceled' || ev.error === 'interrupted')) return;
+            // v6.9：被自动播放策略拦下（没用户手势）—— 重试没有意义，等下一次交互再补读
+            if (ev && ev.error === 'not-allowed') {
+              this._blocked = true;
+              this._pendingSince = 0;
+              console.warn('[speech] 浏览器拦截自动朗读（需用户手势），下次点击将自动恢复');
+              this._armGestureRetry();
+              return;
+            }
             console.warn('[speech] error', ev);
             // v6：真错误（如 synthesis-failed / audio-busy）→ 换一条 utterance 再试
             if ((attempt || 0) < 2) {
@@ -712,29 +789,42 @@
             }
           };
           speechSynthesis.speak(u);
-          // 兜底：500ms 后还没开始播，说明这次 speak 被浏览器吞了（user activation 失效 / 静音 / 后台等），再 speak 一次
+          // 兜底：600ms 后还没开始播，说明这次 speak 被浏览器吞了（引擎卡住 / 队列堵塞）
           const retryT = setTimeout(() => {
-            if (this.muted) return;
-            if (!started && !speechSynthesis.speaking && (attempt || 0) < 2) {
-              console.warn('[speech] 未开始播放，重试第', (attempt || 0) + 1, '次');
-              trySpeak((attempt || 0) + 1);
-            }
-          }, 500);
+            if (this.muted || this._blocked || started) return;
+            if ((attempt || 0) >= 2) return;
+            // v6.9：speaking=true 却不是我们在读 → 引擎卡在残留队列上，先 cancel 再重来
+            try { if (speechSynthesis.speaking) speechSynthesis.cancel(); } catch (e) {}
+            console.warn('[speech] 未开始播放，重试第', (attempt || 0) + 1, '次');
+            trySpeak((attempt || 0) + 1);
+          }, 600);
           this._retryTimers.push(retryT);
         } catch (e) {
           console.warn('[speech] 发音异常', e);
         }
       };
 
+      // v6.9：刚 cancel 过就立刻 speak，Chrome 会把这一句吞掉（换卡时"上一句没停、这一句没读"）
+      const start = (attempt) => {
+        const wait = Math.max(0, 90 - (Date.now() - this._cancelAt));
+        const fire = () => {
+          if (this.muted || this._blocked) return;
+          this._pendingSince = Date.now();
+          trySpeak(attempt);
+        };
+        if (wait > 0) this._retryTimers.push(setTimeout(fire, wait));
+        else fire();
+      };
+
       // 如果 voice 还没好，先等 ready 再播；超时则仍尝试一次（浏览器会用 lang 自动选）
       if (!this.ready) {
         this.whenReady(2500).then(ok => {
           if (this.muted) return;
-          trySpeak(0);
+          start(0);
           if (!ok) console.warn('[speech] voices 未加载，仍尝试用 lang=en-GB 播放');
         });
       } else {
-        trySpeak(0);
+        start(0);
       }
     },
     /** 渲染一个 🔊 按钮；点击触发 speak。clicks 委托给顶层（避免被外部捕获） */
@@ -4691,6 +4781,7 @@
         '浏览器支持语音合成：' + (sup ? '是' : '否（请用 Chrome / Edge / Safari）') + '\n' +
         '已加载语音数量：' + voices + (voices === 0 ? '（语音尚未加载，稍候或刷新页面）' : '') + '\n' +
         '朗读总开关（静音）：' + (state.audioMuted ? '已关闭 🔇' : '开启 🔊') + '\n' +
+        '自动播放拦截：' + (Speech._blocked ? '⚠️ 是（浏览器要求先点一下页面，点任意处会自动恢复）' : '否') + '\n' +
         '自动朗读：' + (state.autoSpeak ? '开启' : '关闭（Ctrl/Cmd+Shift+S 切换）') + '\n' +
         '当前合成引擎状态：' + st;
     };
@@ -4735,6 +4826,12 @@
     window.__syncAudioBanner = () => { if (banner) banner.style.display = state.audioMuted ? 'block' : 'none'; };
 
     report();
+    // v6.9：语音数量 / 拦截状态会异步变化，定时刷新一次面板
+    setInterval(() => {
+      const panel = $('#panel-notebooks');
+      if (panel && !panel.classList.contains('active')) return;
+      report();
+    }, 2000);
   }
 
   document.addEventListener('DOMContentLoaded', init);
