@@ -497,19 +497,14 @@
   function $(sel) { return document.querySelector(sel); }
   function $all(sel) { return document.querySelectorAll(sel); }
   function escapeHtml(str) {
-    const map = {
-      ampersand: /&/g,
-      lt: /</g,
-      gt: />/g,
-      quot: /"/g,
-      apos: /'/g
-    };
-    return String(str || '')
-      .replace(map.ampersand, '&')
-      .replace(map.lt, '<')
-      .replace(map.gt, '>')
-      .replace(map.quot, '"')
-      .replace(map.apos, '\'');
+    // v6.13：修掉转义表被写成恒等映射的问题（原来 & < > " ' 都没有真正转义，
+    // 词条里出现 < 或引号会破坏 DOM / 有注入风险）
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
   // 是否是 DICT 的占位释义（视为"未导入"）
   function isPlaceholderMeaning(s) {
@@ -1434,6 +1429,37 @@
       break;
     }
 
+    // v6.13：词本被删空时，别再显示"已全部掌握"（会让人以为背完了）
+    if (total === 0) {
+      endCardAudio();
+      area.innerHTML = `
+        <div class="study-empty">
+          <div class="icon">📝</div>
+          <h3>这本单词本还没有词条</h3>
+          <p>去「单词本 → 管理词条」添加几个词，就能开始背了。</p>
+          <div style="margin-top:18px" class="row gap wrap">
+            <button class="btn primary" id="goManageWords">去添加词条</button>
+          </div>
+        </div>`;
+      const goManage = $('#goManageWords');
+      if (goManage) goManage.addEventListener('click', () => {
+        $all('.tab').forEach(t => t.classList.remove('active'));
+        const tab = $('.tab[data-tab="notebooks"]');
+        if (tab) tab.classList.add('active');
+        $all('.panel').forEach(p => p.classList.remove('active'));
+        const panel = $('#panel-notebooks');
+        if (panel) panel.classList.add('active');
+        renderBooks();
+        if (manageBookId === book.id) {
+          const host = $('#bookWordsPanel');
+          if (host) host.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } else {
+          openBookWords(book.id);
+        }
+      });
+      return;
+    }
+
     if (remain === 0) {
       endCardAudio();
       area.innerHTML = `
@@ -2130,7 +2156,7 @@
           <div class="book-actions">
             <button class="btn primary" data-act="study" data-id="${b.id}">背诵</button>
             <button class="btn" data-act="spell" data-id="${b.id}">拼写</button>
-            <button class="btn" data-act="view" data-id="${b.id}">查看词条</button>
+            <button class="btn" data-act="words" data-id="${b.id}">📝 管理词条</button>
             <button class="btn" data-act="reset" data-id="${b.id}">重置进度</button>
             <button class="btn danger" data-act="del" data-id="${b.id}">删除</button>
           </div>
@@ -2154,8 +2180,8 @@
           renderStudy();
         } else if (act === 'spell') {
           startSpellScope('book:' + id);
-        } else if (act === 'view') {
-          viewBook(book);
+        } else if (act === 'words') {
+          openBookWords(book.id);
         } else if (act === 'reset') {
           if (!confirm(`重置《${book.name}》的背诵进度？`)) return;
           book.progress.mastered = new Set();
@@ -2272,27 +2298,385 @@
     });
   }
 
-  function viewBook(book) {
-    const w = window.open('', '_blank', 'width=720,height=600');
-    if (!w) { toast('请允许弹窗以查看词条'); return; }
-    const rows = book.words.map((it, i) => `
-      <tr>
-        <td>${i + 1}</td>
-        <td><b>${escapeHtml(it.word)}</b></td>
-        <td>${escapeHtml(it.meaning)}</td>
-        <td>${escapeHtml(it.example || '')}</td>
-        <td>${book.progress.mastered.has(it.word) ? '✓' : '—'}</td>
-      </tr>`).join('');
-    w.document.write(`
-      <meta charset="utf-8"><title>${escapeHtml(book.name)}</title>
-      <style>body{font-family:-apple-system,sans-serif;padding:20px;color:#1f2433}h1{font-size:18px}table{border-collapse:width:100%;font-size:13px}th,td{border-bottom:1px solid #eee;padding:8px;text-align:left;vertical-align:top}</style>
-      <h1>${escapeHtml(book.name)}</h1>
-      <p>共 ${book.words.length} 词 · 已掌握 ${book.progress.mastered.size}</p>
-      <table>
-        <thead><tr><th>#</th><th>Word</th><th>Meaning</th><th>Example</th><th>Status</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    `);
+  /* ---------- 5.1 v6.13 词条管理：单词本内增词 / 删词 ---------- */
+  // 交互内联展开在 #bookWordsPanel（不弹新窗口）：
+  // 搜索时只重渲染列表，不重建外壳，避免输入框失焦。
+  const MANAGE_LIMIT = 400;      // 单次最多渲染 400 行，更多的靠搜索缩小范围
+  let manageBookId = null;
+  let manageQuery = '';
+  let manageSelected = new Set();
+  let manageAddOpen = false;
+
+  function openBookWords(id) {
+    const book = state.books.find(b => b.id === id);
+    if (!book) return;
+    if (manageBookId === id) { closeBookWords(); return; }   // 再点一次 = 收起
+    manageBookId = id;
+    manageQuery = '';
+    manageSelected = new Set();
+    manageAddOpen = false;
+    renderBookWords();
+    const host = $('#bookWordsPanel');
+    if (host) setTimeout(() => { try { host.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {} }, 40);
+  }
+
+  function closeBookWords() {
+    manageBookId = null;
+    manageQuery = '';
+    manageSelected = new Set();
+    manageAddOpen = false;
+    const host = $('#bookWordsPanel');
+    if (host) host.innerHTML = '';
+    renderBooks();
+  }
+
+  /** 当前搜索条件下命中的词（全选 / 计数用，不受渲染上限影响） */
+  function currentManagedWords() {
+    const book = state.books.find(b => b.id === manageBookId);
+    if (!book) return [];
+    const q = manageQuery.trim().toLowerCase();
+    if (!q) return book.words;
+    return book.words.filter(w =>
+      String(w.word || '').toLowerCase().includes(q) ||
+      String(w.meaning || '').toLowerCase().includes(q)
+    );
+  }
+
+  function renderBookWords() {
+    const host = $('#bookWordsPanel');
+    if (!host) return;
+    const book = state.books.find(b => b.id === manageBookId);
+    if (!book) { host.innerHTML = ''; return; }
+    const mastered = book.progress.mastered.size;
+
+    host.innerHTML = `
+      <div class="card manage-card">
+        <div class="row between wrap gap">
+          <div>
+            <h3 style="margin:0 0 4px">📝 词条管理 · ${escapeHtml(book.name)}</h3>
+            <p class="muted small" style="margin:0">共 ${book.words.length} 词 · 已掌握 ${mastered} 词。删除词条会同时清掉它的学习进度与错词本记录。</p>
+          </div>
+          <div class="row gap wrap" style="align-items:center">
+            <button class="btn primary small-btn" id="wordsAddToggle" type="button">${manageAddOpen ? '收起新增区' : '＋ 新增词条'}</button>
+            <button class="btn ghost small-btn" id="wordsClose" type="button">收起管理</button>
+          </div>
+        </div>
+
+        <div id="wordsAddBox" ${manageAddOpen ? '' : 'class="hidden"'} style="margin-top:14px">
+          <label class="lbl" for="wordsAddInput">每行一条：<code>单词#释义</code>；要带例句就写第三段 <code>单词#释义#例句</code></label>
+          <textarea id="wordsAddInput" class="textarea" rows="5" placeholder="abandon#vt. 放弃，抛弃#They had to abandon the plan."></textarea>
+          <div class="row between wrap gap" style="margin-top:8px">
+            <span class="muted small">同名词已存在时更新释义，不会重复添加；也支持 Tab / <code>|</code> / 双空格分隔。</span>
+            <button class="btn primary small-btn" id="wordsAddConfirm" type="button">加入这本单词本</button>
+          </div>
+        </div>
+
+        <div class="row between wrap gap manage-toolbar">
+          <div class="row gap wrap" style="align-items:center">
+            <input id="wordsSearch" class="input" placeholder="搜索单词或释义…" value="${escapeHtml(manageQuery)}" style="min-width:190px" />
+            <span class="muted small" id="wordsCount"></span>
+          </div>
+          <div class="row gap" style="align-items:center">
+            <button class="btn ghost small-btn" id="wordsSelectAll" type="button">全选当前</button>
+            <button class="btn danger small-btn" id="wordsDeleteSel" type="button" disabled>删除选中</button>
+          </div>
+        </div>
+
+        <div id="wordsList" class="words-table"></div>
+      </div>`;
+
+    const addToggle = $('#wordsAddToggle');
+    if (addToggle) addToggle.addEventListener('click', () => {
+      manageAddOpen = !manageAddOpen;
+      const box = $('#wordsAddBox');
+      if (box) box.classList.toggle('hidden', !manageAddOpen);
+      addToggle.textContent = manageAddOpen ? '收起新增区' : '＋ 新增词条';
+      if (manageAddOpen) setTimeout(() => { const ta = $('#wordsAddInput'); if (ta) ta.focus(); }, 30);
+    });
+
+    const closeBtn = $('#wordsClose');
+    if (closeBtn) closeBtn.addEventListener('click', closeBookWords);
+
+    const addBtn = $('#wordsAddConfirm');
+    if (addBtn) addBtn.addEventListener('click', () => {
+      const ta = $('#wordsAddInput');
+      const list = parseAddWordLines(ta ? ta.value : '');
+      if (!list.length) { toast('请按「单词#释义」的格式每行写一条', 'error'); return; }
+      const r = addWordsToBook(book, list);
+      manageAddOpen = true;
+      renderBookWords();
+      renderBooks();
+      const parts = [];
+      if (r.added) parts.push(`新增 ${r.added}`);
+      if (r.updated) parts.push(`更新 ${r.updated}`);
+      if (r.skipped) parts.push(`跳过 ${r.skipped}`);
+      toast(`已${parts.join('，')} 条词条`, 'success');
+      const ta2 = $('#wordsAddInput');
+      if (ta2) ta2.focus();
+    });
+
+    const search = $('#wordsSearch');
+    if (search) search.addEventListener('input', () => {
+      manageQuery = search.value;
+      renderWordsList();
+    });
+
+    const selAll = $('#wordsSelectAll');
+    if (selAll) selAll.addEventListener('click', () => {
+      const rows = currentManagedWords();
+      const norm = window.VocabData.normalizeKey;
+      const allSelected = rows.length > 0 && rows.every(w => manageSelected.has(norm(w.word)));
+      if (allSelected) rows.forEach(w => manageSelected.delete(norm(w.word)));
+      else rows.forEach(w => manageSelected.add(norm(w.word)));
+      renderWordsList();
+    });
+
+    const delSel = $('#wordsDeleteSel');
+    if (delSel) delSel.addEventListener('click', () => {
+      const words = Array.from(manageSelected);
+      if (!words.length) return;
+      if (!confirm(`从《${book.name}》删除选中的 ${words.length} 个词？\n\n同时清掉这些词的学习进度；如果某个词只来自这本，错词本里的记录会一起删除。操作不可撤销。`)) return;
+      const n = removeWordsFromBook(book, words);
+      manageSelected = new Set();
+      renderBookWords();
+      renderBooks();
+      toast(`已删除 ${n} 个词条`, 'success');
+    });
+
+    renderWordsList();
+  }
+
+  function renderWordsList() {
+    const box = $('#wordsList');
+    const book = state.books.find(b => b.id === manageBookId);
+    if (!box || !book) return;
+    const norm = window.VocabData.normalizeKey;
+    const all = book.words;
+    const shown = currentManagedWords().slice(0, MANAGE_LIMIT);
+
+    if (!all.length) {
+      box.innerHTML = '<div class="words-empty">这本还没有词条，点右上角「＋ 新增词条」加几个吧。</div>';
+      updateManageSelBar();
+      return;
+    }
+    if (!shown.length) {
+      box.innerHTML = `<div class="words-empty">没有匹配「${escapeHtml(manageQuery)}」的词条。</div>`;
+      updateManageSelBar();
+      return;
+    }
+
+    box.innerHTML = shown.map(w => {
+      const key = norm(w.word);
+      const ok = book.progress.mastered.has(w.word) || book.progress.mastered.has(key);
+      const sel = manageSelected.has(key);
+      return `
+        <div class="words-row${sel ? ' is-selected' : ''}">
+          <input type="checkbox" class="words-check" data-key="${escapeHtml(key)}" ${sel ? 'checked' : ''} aria-label="选择 ${escapeHtml(w.word)}" />
+          <div class="words-main">
+            <div class="w-term">${escapeHtml(w.word)}</div>
+            <div class="w-meaning">${escapeHtml(w.meaning || '（暂无释义）')}</div>
+            ${w.example ? `<div class="w-example">${escapeHtml(w.example)}</div>` : ''}
+          </div>
+          <span class="w-status${ok ? ' ok' : ''}">${ok ? '已掌握' : '学习中'}</span>
+          <div class="row-actions">
+            <button class="btn ghost small-btn" data-act="speak" data-word="${escapeHtml(w.word)}" title="朗读这个词">🔊</button>
+            <button class="btn ghost small-btn" data-act="edit" data-word="${escapeHtml(w.word)}" title="修改释义 / 例句">编辑</button>
+            <button class="btn danger small-btn" data-act="del" data-word="${escapeHtml(w.word)}" title="从这本单词本删除">删除</button>
+          </div>
+        </div>`;
+    }).join('');
+
+    // 事件委托：列表会频繁重建，绑在容器上比逐行绑定更稳
+    if (!box.dataset.bound) {
+      box.dataset.bound = '1';
+      box.addEventListener('change', (e) => {
+        const cb = e.target.closest('.words-check');
+        if (!cb) return;
+        const k = cb.dataset.key;
+        if (cb.checked) manageSelected.add(k); else manageSelected.delete(k);
+        const row = cb.closest('.words-row');
+        if (row) row.classList.toggle('is-selected', cb.checked);
+        updateManageSelBar();
+      });
+      box.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-act]');
+        if (!btn) return;
+        const b = state.books.find(x => x.id === manageBookId);
+        if (!b) return;
+        const word = btn.dataset.word;
+        if (btn.dataset.act === 'speak') {
+          manualSpeak(word);
+        } else if (btn.dataset.act === 'edit') {
+          const it = b.words.find(w => norm(w.word) === norm(word));
+          if (!it) return;
+          openEditModal({ word: it.word, meaning: it.meaning || '', example: it.example || '', scope: 'word' });
+        } else if (btn.dataset.act === 'del') {
+          if (!confirm(`从《${b.name}》删除「${word}」？\n\n学习进度会一并清空；如果这个词只来自这本，错词本记录也会删除。`)) return;
+          const n = removeWordsFromBook(b, [word]);
+          manageSelected.delete(norm(word));
+          renderBookWords();
+          renderBooks();
+          if (n) toast(`已删除「${word}」`, 'success');
+        }
+      });
+    }
+
+    updateManageSelBar();
+  }
+
+  function updateManageSelBar() {
+    const book = state.books.find(b => b.id === manageBookId);
+    if (!book) return;
+    const btn = $('#wordsDeleteSel');
+    if (btn) {
+      btn.disabled = manageSelected.size === 0;
+      btn.textContent = manageSelected.size ? `删除选中（${manageSelected.size}）` : '删除选中';
+    }
+    const cnt = $('#wordsCount');
+    if (cnt) {
+      const filtered = currentManagedWords().length;
+      const total = book.words.length;
+      cnt.textContent = filtered === total
+        ? `共 ${total} 词`
+        : `匹配 ${filtered} / 共 ${total} 词${filtered > MANAGE_LIMIT ? `（仅显示前 ${MANAGE_LIMIT}）` : ''}`;
+    }
+  }
+
+  /** 解析「新增词条」输入：每行 单词#释义[#例句]，也兼容 Tab / | / 双空格 */
+  function parseAddWordLines(text) {
+    const out = [];
+    String(text || '').split(/\r?\n/).forEach(line => {
+      const raw = line.trim();
+      if (!raw) return;
+      if (raw.indexOf('#') >= 0) {
+        const parts = raw.split('#').map(s => s.trim());
+        if (parts[0] && parts[1]) out.push({ term: parts[0], meaning: parts[1], example: parts.slice(2).join(' ').trim() });
+        return;
+      }
+      const hit = window.VocabData.parseDictLines(raw)[0];
+      if (hit && hit.term && hit.meaning) out.push({ term: hit.term, meaning: hit.meaning, example: '' });
+    });
+    return out;
+  }
+
+  function addWordsToBook(book, list) {
+    const norm = window.VocabData.normalizeKey;
+    let added = 0, updated = 0, skipped = 0;
+    for (const item of list) {
+      const key = norm(item.term);
+      const meaning = String(item.meaning || '').trim();
+      if (!key || !meaning) { skipped++; continue; }
+      const existing = book.words.find(w => norm(w.word) === key);
+      if (existing) {
+        existing.meaning = meaning;
+        if (item.example) existing.example = item.example;
+        updated++;
+        continue;
+      }
+      book.words.push({
+        word: key,
+        meaning,
+        example: item.example || '',
+        type: window.VocabData.detectType(key),
+        mastered: false
+      });
+      added++;
+    }
+    if (added || updated) persist();
+    return { added, updated, skipped };
+  }
+
+  /** 从某一本单词本删除若干词条，并级联清理只属于这本书的进度 */
+  function removeWordsFromBook(book, words) {
+    const norm = window.VocabData.normalizeKey;
+    const wanted = new Set(words.map(w => norm(w)));
+    const keys = new Set(book.words.filter(w => wanted.has(norm(w.word))).map(w => norm(w.word)));
+    if (!keys.size) return 0;
+
+    // 1) 词条本身
+    book.words = book.words.filter(w => !keys.has(norm(w.word)));
+
+    // 2) 已掌握集合（历史数据里原词 / 归一化两种写法都可能有）
+    for (const k of Array.from(book.progress.mastered)) {
+      if (keys.has(norm(k))) book.progress.mastered.delete(k);
+    }
+
+    // 3) 错词本：这本是唯一来源 → 整条移除；还有别的来源 → 只摘掉这本
+    state.wrongBook = state.wrongBook.reduce((acc, w) => {
+      if (!keys.has(norm(w.word))) { acc.push(w); return acc; }
+      const src = (w.sources || []).filter(s => s !== book.id);
+      if (!src.length) return acc;
+      w.sources = src;
+      acc.push(w);
+      return acc;
+    }, []);
+
+    // 4) 通过规则 + 队列 / 快照（只动这本书的卡，别的书的同名词不受影响）
+    for (const k of keys) {
+      PassRule.clear('study', k);
+      PassRule.clear('spell', k);
+      PassRule.clear('listen', k);
+      purgeWordFromBookProgress(k, book.id);
+    }
+
+    persist();
+    return keys.size;
+  }
+
+  function purgeWordFromBookProgress(wordKey, bookId) {
+    const norm = window.VocabData.normalizeKey;
+
+    // 背诵队列只属于当前这本书
+    if (state.activeBookId === bookId) {
+      const idx = state.studyIndex;
+      let removedBefore = 0;
+      for (let i = state.studyQueue.length - 1; i >= 0; i--) {
+        const it = state.studyQueue[i];
+        if (it && norm(it.word) === wordKey) {
+          if (i < idx) removedBefore++;
+          state.studyQueue.splice(i, 1);
+        }
+      }
+      state.studyIndex = Math.max(0, Math.min(idx - removedBefore, state.studyQueue.length));
+    }
+
+    // 拼写 / 听音队列项带 sourceBookId
+    const dropFrom = (queue, idx) => {
+      if (!Array.isArray(queue) || !queue.length) return idx;
+      let removedBefore = 0;
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const it = queue[i];
+        if (it && norm(it.key || it.word) === wordKey && it.sourceBookId === bookId) {
+          if (i < idx) removedBefore++;
+          queue.splice(i, 1);
+        }
+      }
+      return Math.max(0, Math.min(idx - removedBefore, queue.length));
+    };
+    state.spellIndex = dropFrom(state.spellQueue, state.spellIndex);
+    state.listenIndex = dropFrom(state.listenQueue, state.listenIndex);
+
+    // 分片快照（刷新后用来恢复队列）
+    const cleanSnap = (map, isStudy) => {
+      Object.keys(map || {}).forEach(scope => {
+        const snap = map[scope];
+        if (!snap || !Array.isArray(snap.queue)) return;
+        if (isStudy && scope !== bookId) return;   // 背诵快照按 bookId 分片
+        snap.queue = snap.queue.filter(it => {
+          const k = it && (it.key || it.word);
+          if (norm(k) !== wordKey) return true;      // 不是这个词 → 保留
+          if (isStudy) return false;                 // 这本书的背诵快照 → 删
+          return it.sourceBookId !== bookId;         // 别的书的同名卡 → 保留
+        });
+        if (!snap.queue.length) delete map[scope];
+        else if (typeof snap.index === 'number' && snap.index > snap.queue.length - 1) {
+          snap.index = Math.max(0, snap.queue.length - 1);
+        }
+      });
+    };
+    cleanSnap(state.lastStudyMap, true);
+    cleanSnap(state.lastSpellMap, false);
+    cleanSnap(state.lastListenMap, false);
   }
 
   // 构造完整备份对象（导出下载 与 本地文件夹自动备份 共用）
@@ -4881,7 +5265,7 @@
     if (activePanel?.id === 'panel-study') renderStudy();
     else if (activePanel?.id === 'panel-wrong') renderWrong();
     else if (activePanel?.id === 'panel-dict') renderDict();
-    else if (activePanel?.id === 'panel-notebooks') renderBooks();
+    else if (activePanel?.id === 'panel-notebooks') { renderBooks(); if (manageBookId) renderBookWords(); }
   }
 
   /** v6：把某个词从所有"学习进度"的队列里清掉（背诵 / 拼写 / 听音 / 各分片快照） */
@@ -4960,7 +5344,7 @@
     if (activePanel?.id === 'panel-study') renderStudy();
     else if (activePanel?.id === 'panel-wrong') renderWrong();
     else if (activePanel?.id === 'panel-dict') renderDict();
-    else if (activePanel?.id === 'panel-notebooks') renderBooks();
+    else if (activePanel?.id === 'panel-notebooks') { renderBooks(); if (manageBookId) renderBookWords(); }
     else if (activePanel?.id === 'panel-spell') renderSpellInit();
     else if (activePanel?.id === 'panel-review') renderReview();
   }
