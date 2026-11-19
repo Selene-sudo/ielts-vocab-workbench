@@ -427,6 +427,8 @@
       }
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+    // v6.14：任何改动都触发本地文件夹备份（8 秒防抖，避免每个操作都整份重写）
+    try { scheduleLocalBackup(); } catch (e) {}
     // v5.8：登录后自动同步到云端（SYNC.schedule 内部 1.5s 防抖）
     if (window.SYNC) window.SYNC.schedule(2000);
   }
@@ -2715,11 +2717,32 @@
   }
 
   /* ---------- 本地文件夹自动备份（File System Access API） ---------- */
-  // 把学习数据覆盖写入用户选定的本地文件夹（vocab-data.json）。
-  // 仅 Chromium 系（Chrome / Edge）支持 showDirectoryPicker；Safari / Firefox 用「导出全部（JSON）」手动下载兜底。
+  // v6.14：学习数据直接覆盖写入 ~/Documents/雅思词汇备份/vocab-data.json
+  //  · 有改动 → 停手 8 秒后自动写（防抖，连续操作只写一次）
+  //  · 另有 3 分钟定时兜底；切后台 / 关页面 / 关掉标签页前强制写
+  //  · 权限只需授权一次；被浏览器回收后，你下一次点击页面会自动续期
+  // 仅 Chromium 系（Chrome / Edge）支持 showDirectoryPicker；Safari / Firefox 用「导出全部（JSON）」兜底。
   const BACKUP_DIR_STORE = 'vocabmaster.backupDir';
   const BACKUP_FILE_NAME = 'vocab-data.json';
   const LS_LAST_LOCAL_BACKUP = 'vocabmaster.lastLocalBackup';
+  const BACKUP_DEBOUNCE_MS = 8000;
+  const BACKUP_AUTOSAVE_MS = 3 * 60 * 1000;
+  const BACKUP_MIN_GAP_MS = 15000;
+
+  // 用 var：persist() 可能在模块初始化完成前被调用，避免 const 的暂时性死区
+  var LocalBackup = {
+    handle: null,
+    granted: false,
+    dirty: false,
+    writing: false,
+    lastAt: 0,
+    error: '',
+    rev: 0,
+    debounceTimer: 0,
+    retryTimer: 0,
+    intervalTimer: 0,
+    gestureArmed: false
+  };
 
   function _idb() {
     return new Promise((res, rej) => {
@@ -2748,53 +2771,160 @@
     });
   }
 
-  // auto=true 时不主动弹权限窗（用于打开应用 / 切后台时的静默备份）
-  async function writeLocalBackup(auto) {
+  /** v6.14：把当前状态写进用户选定的文件夹。auto=true 时绝不弹窗，权限没拿到就交给手势续期。 */
+  async function writeLocalBackup(auto, force) {
     if (!window.showDirectoryPicker) return { ok: false, reason: 'unsupported' };
-    let handle;
-    try { handle = await _getDirHandle(); } catch (e) { handle = null; }
+    if (!LocalBackup.handle) {
+      try { LocalBackup.handle = await _getDirHandle(); } catch (e) {}
+    }
+    const handle = LocalBackup.handle;
     if (!handle) return { ok: false, reason: 'no-dir' };
-    try {
-      const perm = { mode: 'readwrite' };
-      const cur = await handle.queryPermission(perm);
-      if (cur !== 'granted') {
-        if (auto) return { ok: false, reason: 'no-permission' };
-        if ((await handle.requestPermission(perm)) !== 'granted') return { ok: false, reason: 'no-permission' };
+    if (LocalBackup.writing) return { ok: false, reason: 'busy' };
+
+    // 两次写入至少间隔 15 秒，避免连续操作时反复整份重写；超时的改动排队到间隔结束
+    const now = Date.now();
+    if (!force && LocalBackup.lastAt && now - LocalBackup.lastAt < BACKUP_MIN_GAP_MS) {
+      LocalBackup.dirty = true;
+      if (LocalBackup.retryTimer) clearTimeout(LocalBackup.retryTimer);
+      LocalBackup.retryTimer = setTimeout(() => {
+        LocalBackup.retryTimer = 0;
+        if (LocalBackup.dirty) writeLocalBackup(true, false);
+      }, BACKUP_MIN_GAP_MS - (now - LocalBackup.lastAt) + 200);
+      return { ok: false, reason: 'throttled' };
+    }
+
+    const perm = { mode: 'readwrite' };
+    let cur = 'prompt';
+    try { cur = await handle.queryPermission(perm); } catch (e) { cur = 'prompt'; }
+    if (cur !== 'granted') {
+      if (auto) {
+        LocalBackup.granted = false;
+        armPermissionGesture();
+        fmtLocalBackupStatus();
+        return { ok: false, reason: 'no-permission' };
       }
+      try { cur = await handle.requestPermission(perm); } catch (e) { cur = 'denied'; }
+      if (cur !== 'granted') {
+        LocalBackup.granted = false;
+        armPermissionGesture();
+        fmtLocalBackupStatus();
+        return { ok: false, reason: 'no-permission' };
+      }
+    }
+
+    LocalBackup.granted = true;
+    LocalBackup.writing = true;
+    try {
       const data = buildFullBackup();
       const fileHandle = await handle.getFileHandle(BACKUP_FILE_NAME, { create: true });
       const writable = await fileHandle.createWritable();
       await writable.write(JSON.stringify(data, null, 2));
       await writable.close();
       const ts = new Date().toISOString();
+      LocalBackup.lastAt = Date.now();
+      LocalBackup.dirty = false;
+      LocalBackup.error = '';
       try { localStorage.setItem(LS_LAST_LOCAL_BACKUP, ts); } catch (e) {}
+      fmtLocalBackupStatus();
       return { ok: true, at: ts };
     } catch (e) {
+      LocalBackup.error = String((e && e.message) || e);
       console.error('writeLocalBackup failed', e);
-      return { ok: false, reason: 'error', error: String(e) };
+      fmtLocalBackupStatus();
+      return { ok: false, reason: 'error', error: LocalBackup.error };
+    } finally {
+      LocalBackup.writing = false;
     }
+  }
+
+  /** v6.14：每次改动都调这里 —— 记脏 + 8 秒防抖写盘 */
+  function scheduleLocalBackup() {
+    if (!LocalBackup) return;
+    LocalBackup.rev++;
+    LocalBackup.dirty = true;
+    if (!window.showDirectoryPicker || !LocalBackup.handle) return;
+    if (LocalBackup.debounceTimer) clearTimeout(LocalBackup.debounceTimer);
+    LocalBackup.debounceTimer = setTimeout(() => {
+      LocalBackup.debounceTimer = 0;
+      if (LocalBackup.dirty && LocalBackup.granted) writeLocalBackup(true, false);
+    }, BACKUP_DEBOUNCE_MS);
+  }
+
+  /** v6.14：权限被回收后，用你下一次点击页面来静默续期（只尝试一次，不反复弹窗） */
+  function armPermissionGesture() {
+    if (LocalBackup.gestureArmed) return;
+    LocalBackup.gestureArmed = true;
+    const run = async () => {
+      document.removeEventListener('pointerdown', run, true);
+      document.removeEventListener('keydown', run, true);
+      LocalBackup.gestureArmed = false;
+      if (!LocalBackup.handle) return;
+      const perm = { mode: 'readwrite' };
+      let cur = 'prompt';
+      try { cur = await LocalBackup.handle.queryPermission(perm); } catch (e) {}
+      if (cur !== 'granted') {
+        try { cur = await LocalBackup.handle.requestPermission(perm); } catch (e) { cur = 'denied'; }
+      }
+      if (cur === 'granted') {
+        LocalBackup.granted = true;
+        writeLocalBackup(true, true);
+      } else {
+        fmtLocalBackupStatus();
+      }
+    };
+    document.addEventListener('pointerdown', run, true);
+    document.addEventListener('keydown', run, true);
+  }
+
+  function _relTime(t) {
+    const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + ' 秒前';
+    if (s < 3600) return Math.round(s / 60) + ' 分钟前';
+    return Math.round(s / 3600) + ' 小时前';
   }
 
   function fmtLocalBackupStatus() {
     const el = $('#backupStatus');
     if (!el) return;
     if (!window.showDirectoryPicker) {
-      el.innerHTML = '当前浏览器不支持「选择文件夹」自动备份，请用上方 <b>导出全部（JSON）</b> 手动下载（Chrome / Edge 支持自动备份）';
+      el.innerHTML = '当前浏览器不支持「选择文件夹」自动备份，请用下方 <b>导出全部（JSON）</b> 手动下载（Chrome / Edge 支持自动备份）';
       return;
     }
-    let ts = null;
-    try { ts = localStorage.getItem(LS_LAST_LOCAL_BACKUP); } catch (e) {}
-    if (ts) {
-      const d = new Date(ts);
-      el.innerHTML = `上次本地备份：<b>${d.toLocaleString('zh-CN')}</b> → <code>vocab-data.json</code>`;
-    } else {
-      el.innerHTML = '尚未设置本地备份文件夹，点「📁 选择本地备份文件夹」并选中 <b>~/Documents/雅思词汇备份</b>';
+    const h = LocalBackup.handle;
+    if (!h) {
+      let ts = null;
+      try { ts = localStorage.getItem(LS_LAST_LOCAL_BACKUP); } catch (e) {}
+      el.innerHTML = '尚未设置备份文件夹。点「📁 选择本地备份文件夹」，选中 <b>~/Documents/雅思词汇备份</b>'
+        + '（注意选这一层，不要选里面的 <code>vocab-platform</code>）。'
+        + (ts ? '<br>上次备份：' + new Date(ts).toLocaleString('zh-CN') : '');
+      return;
     }
+    const lines = [];
+    const isWrongFolder = (h.name === 'vocab-platform');
+    lines.push('备份目录：<b>' + escapeHtml(h.name || '（未知）') + '</b> → <code>' + BACKUP_FILE_NAME + '</code>'
+      + (isWrongFolder
+        ? '<br><span class="warn">⚠️ 现在指向的是代码目录，数据会写进 <code>vocab-platform/vocab-data.json</code>。请重新选择上一层「雅思词汇备份」。</span>'
+        : ''));
+    if (!LocalBackup.granted) {
+      lines.push('⚠️ 浏览器当前未授权写入 —— 在页面上随便点一下就会自动重新授权（只需一次）');
+    }
+    if (LocalBackup.lastAt) {
+      lines.push('上次成功保存：<b>' + new Date(LocalBackup.lastAt).toLocaleTimeString('zh-CN') + '</b>（'
+        + _relTime(LocalBackup.lastAt) + '）'
+        + (LocalBackup.granted ? ' · 改动后自动保存已开启（每 3 分钟兜底一次）' : ''));
+    } else if (LocalBackup.granted) {
+      lines.push('自动保存已开启，正在写入…');
+    }
+    if (LocalBackup.error) {
+      lines.push('<span class="warn">最近一次写入失败：' + escapeHtml(LocalBackup.error) + '</span>');
+    }
+    el.innerHTML = lines.join('<br>');
   }
 
   function bindLocalBackup() {
     const pickBtn = $('#pickBackupDir');
     const nowBtn = $('#backupNow');
+
     if (pickBtn) {
       pickBtn.addEventListener('click', async () => {
         if (!window.showDirectoryPicker) {
@@ -2802,12 +2932,24 @@
           return;
         }
         try {
-          const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
-          await _saveDirHandle(handle);
-          const r = await writeLocalBackup(false);
-          if (r.ok) toast('✅ 已选择文件夹并立即备份了一份数据');
-          else if (r.reason === 'no-permission') toast('已保存文件夹，但本次未授权写入，下次打开应用会自动重试');
-          else toast('已保存备份文件夹');
+          const picked = await window.showDirectoryPicker({
+            id: 'vocabmaster-backup',
+            mode: 'readwrite',
+            startIn: 'documents'
+          });
+          if (picked && picked.name === 'vocab-platform') {
+            toast('⚠️ 选到代码目录了，请回到上一层选「雅思词汇备份」');
+            return;
+          }
+          await _saveDirHandle(picked);
+          LocalBackup.handle = picked;
+          LocalBackup.granted = false;
+          LocalBackup.lastAt = 0;
+          LocalBackup.error = '';
+          const r = await writeLocalBackup(false, true);
+          if (r.ok) toast('✅ 已连接备份目录，并写入 ' + BACKUP_FILE_NAME);
+          else if (r.reason === 'no-permission') toast('目录已记住，但浏览器未授权写入');
+          else toast('目录已记住，但本次写入失败：' + (r.error || r.reason));
           fmtLocalBackupStatus();
         } catch (e) {
           if (e && e.name === 'AbortError') return; // 用户取消选择
@@ -2816,25 +2958,70 @@
         }
       });
     }
+
     if (nowBtn) {
       nowBtn.addEventListener('click', async () => {
-        const r = await writeLocalBackup(false);
-        if (r.ok) { toast('✅ 已立即备份数据到本地文件夹'); fmtLocalBackupStatus(); }
+        const r = await writeLocalBackup(false, true);
+        if (r.ok) { toast('✅ 已立即写入 ' + BACKUP_FILE_NAME); fmtLocalBackupStatus(); }
         else if (r.reason === 'no-dir') toast('请先点「📁 选择本地备份文件夹」');
         else if (r.reason === 'no-permission') toast('浏览器未授权写入，请重新点「选择本地备份文件夹」');
         else if (r.reason === 'unsupported') toast('当前浏览器不支持，请用「导出全部（JSON）」下载');
         else toast('备份失败：' + (r.error || r.reason));
       });
     }
-    fmtLocalBackupStatus();
-    // 打开应用时静默备份一次（若已设置文件夹且已授权）
-    if (window.showDirectoryPicker) {
-      writeLocalBackup(true).then(r => { if (r.ok) fmtLocalBackupStatus(); });
-    }
-    // 切换到后台（离开页面）时再静默备份一次，确保本次学习进度落盘
+
+    if (!window.showDirectoryPicker) { fmtLocalBackupStatus(); return; }
+
+    // 初始化：读回上次选定的文件夹句柄
+    _getDirHandle().then(async h => {
+      if (!h) { fmtLocalBackupStatus(); return; }
+      LocalBackup.handle = h;
+      let cur = 'prompt';
+      try { cur = await h.queryPermission({ mode: 'readwrite' }); } catch (e) {}
+      if (cur === 'granted') {
+        LocalBackup.granted = true;
+        writeLocalBackup(true, true);
+      } else {
+        armPermissionGesture();
+      }
+      fmtLocalBackupStatus();
+    }).catch(() => fmtLocalBackupStatus());
+
+    // 切到后台 / 关页面 → 立即落盘，确保进度不丢
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') writeLocalBackup(true).then(r => { if (r.ok) fmtLocalBackupStatus(); });
+      if (document.visibilityState === 'hidden') {
+        if (LocalBackup.dirty) writeLocalBackup(true, true);
+      } else {
+        fmtLocalBackupStatus();
+      }
     });
+    window.addEventListener('pagehide', () => {
+      if (LocalBackup.dirty) writeLocalBackup(true, true);
+    });
+
+    // 定时兜底：每 3 分钟检查一次，有改动就写
+    if (LocalBackup.intervalTimer) clearInterval(LocalBackup.intervalTimer);
+    LocalBackup.intervalTimer = setInterval(() => {
+      if (LocalBackup.dirty) writeLocalBackup(true, false);
+    }, BACKUP_AUTOSAVE_MS);
+
+    // 「x 分钟前」需要自己走字，每 30 秒刷一次
+    setInterval(fmtLocalBackupStatus, 30000);
+
+    // 排查入口
+    window.__localBackup = {
+      write: (force) => writeLocalBackup(false, force !== false),
+      flush: () => writeLocalBackup(true, true),
+      useHandle: (h) => { LocalBackup.handle = h; LocalBackup.granted = true; },
+      state: () => ({
+        name: LocalBackup.handle && LocalBackup.handle.name,
+        granted: LocalBackup.granted,
+        dirty: LocalBackup.dirty,
+        lastAt: LocalBackup.lastAt,
+        error: LocalBackup.error,
+        rev: LocalBackup.rev
+      })
+    };
   }
 
   function bindBooks() {
