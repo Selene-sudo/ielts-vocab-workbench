@@ -3,7 +3,7 @@
 > 一个把「导入 → 背诵 → 听音 → 拼写 → 错词按日期归档」串成完整学习回路的雅思词汇工具。
 > 原生 HTML / CSS / JavaScript 构建，零框架、零构建步骤，可选云端同步。
 
-**Live Demo** · https://ielts-vocab-workbench-97952.app.workbuddy.host/
+**Live Demo** · https://ielts-vocab-workbench-97952.app.workbuddy.host/?sharecode=OP6EQC2VNG
 
 ![界面预览](docs/preview.png)
 
@@ -51,7 +51,9 @@ v6.7 做了一次完整的视觉重做，目标是让工具"拿得出手"——�
 
 ## 线上地址（当前生效）
 
-**https://ielts-vocab-workbench-97952.app.workbuddy.host/**
+**https://ielts-vocab-workbench-97952.app.workbuddy.host/?sharecode=OP6EQC2VNG**
+
+> 地址末尾的 `?sharecode=OP6EQC2VNG` 是访问分享码，**不能省略**。少了它会被平台拦在「链接不完整」页面（HTTP 403），看起来像站点挂了，其实只是缺参数。
 
 > 旧地址 `https://29434aabec424d5f960282f5c0ffa5a2.app.workbuddy.link/` 已无法从本工作区更新，代码停留在旧版本，请勿再使用。
 
