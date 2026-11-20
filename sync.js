@@ -134,7 +134,9 @@
           return {
             user_id: userId, word: w.word, type: w.type || null,
             meaning: w.meaning || null, sources: w.sources || [],
-            srs: w.srs || null, correct_count: w.correctCount || 0,
+            // v6.15：错词按日期归档，表里没有 date 列，就把日期塞进 srs 这个 jsonb 里带着走
+            srs: w.srs ? Object.assign({}, w.srs, { wrongDate: w.date || null }) : { wrongDate: w.date || null },
+            correct_count: w.correctCount || 0,
             last_seen: fmtDate(w.lastSeen)
           };
         });
@@ -234,6 +236,7 @@
         return {
           word: w.word, type: w.type, meaning: w.meaning, sources: w.sources || [],
           srs: w.srs, correctCount: w.correct_count || 0,
+          date: (w.srs && w.srs.wrongDate) || null,
           lastSeen: w.last_seen ? new Date(w.last_seen).getTime() : null
         };
       }),

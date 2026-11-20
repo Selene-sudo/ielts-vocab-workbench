@@ -20,7 +20,7 @@
     studyPass: {},      // v6.2：{ word: { s: 已连续答对, n: 本次要求 } } —— 答错后需连续答对 2 次
     audioMuted: false,  // v6：全局朗读总开关（顶部 🔊 按钮）
     dictFilter: 'all',  // all | word | phrase
-    editScope: 'dict',
+    editScope: 'word',
     // 拼写平台状态
     spellScope: 'due',  // due | book:<id> | wrong | all
     spellQueue: [],
@@ -36,6 +36,7 @@
     lastSpellMap: {},   // { [scope]: { index, answered, queue: [{word,key,sourceBookId,lastOk,userInput}] } }
     lastListenMap: {},  // { [scope]: { index, answered, queue: [{word,key,sourceBookId}] } }
     wrongSessionScope: 'all', // 错词复习会话限定的范围：all | book:<id> | orphans
+    wrongSessionDate: 'all',  // 错词复习会话限定的日期：all | YYYY-MM-DD（v6.15）
     wrongCardMode: 'recall',  // 错词复习卡片模式：recall（认不认识）| spell（拼写）
     wrongSpellAnswered: false,
     wrongSpellOk: false,
@@ -53,6 +54,7 @@
     autoSpeak: true,
     // —— v5：错词 / 复习 tab 的过滤 ——
     wrongFilter: 'all', // all | book:<id> | orphans（没有 sources 的）
+    wrongDateFilter: 'all', // all | YYYY-MM-DD（v6.15：错词按日期归档）
     reviewFilter: 'all' // all | book:<id>
   };
 
@@ -199,7 +201,7 @@
     // A. 错词复习会话 → 重置这个范围里的错词进度
     if (state.activeWrongSession) {
       const scope = state.wrongSessionScope || 'all';
-      const due = filterWrongByScope(state.wrongBook.filter(w => (w.correctCount || 0) < 3), scope);
+      const due = filterWrongByScope(state.wrongBook, scope, state.wrongSessionDate || 'all');
       if (!due.length) { toast('当前范围没有待复习的错词'); return; }
       if (!confirm(
         `重置「${wrongScopeLabel(scope)}」的错词复习进度？\n\n` +
@@ -254,7 +256,7 @@
       lines.push(`· 《${book.name}》全 ${words.length} 个词的「已掌握」标记清空，全部重新进入拼写`);
     } else if (scope.startsWith('wrong:')) {
       // wrong（全部）/ wrong:book:<id>（某词本错词）/ wrong:orphans（未归类错词）
-      let wrongList = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+      let wrongList = state.wrongBook.slice();
       if (scope.startsWith('wrong:book:')) {
         const id = scope.slice('wrong:book:'.length);
         wrongList = wrongList.filter(w => w.sources && w.sources.includes(id));
@@ -297,7 +299,7 @@
       if (!words.length) { toast('这本还没有词条'); return; }
       lines.push(`· 《${book.name}》全 ${words.length} 个词的「已掌握」标记清空，全部重新进入听音`);
     } else if (scope === 'wrong') {
-      words = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+      words = state.wrongBook.slice();
       if (!words.length) { toast('错词本里没有待复习的词'); return; }
       lines.push(`· ${words.length} 个错词的「已答对次数」清零，复习阶梯回到第 1 天`);
     } else {
@@ -418,6 +420,7 @@
         autoSpeak: state.autoSpeak,
         audioMuted: !!state.audioMuted,
         wrongFilter: state.wrongFilter,
+        wrongDateFilter: state.wrongDateFilter,
         reviewFilter: state.reviewFilter,
         activeBookId: state.activeBookId,
         spellScope: state.spellScope,
@@ -463,7 +466,12 @@
         if (!w.srs) w.srs = newSrsRecord();
         if (typeof w.correctCount !== 'number') w.correctCount = 0;
         if (isPlaceholderMeaning(w.meaning)) w.meaning = '';
+        // v6.15：补上归档日期（老数据按最近出错时间推算），再裁掉超出 30 个日期的部分
+        w.date = wrongDateOf(w);
       }
+      // 超过 30 个日期 → 自动丢掉最早的那天（提示留给 init 里弹）
+      const prunedWrong = pruneWrongDates();
+      if (prunedWrong) state._prunedWrongCount = prunedWrong;
       // v6.1：补回历史错词缺失的中文释义（只填空，不覆盖）
       try { healWrongMeanings(); } catch (e) { console.warn('healWrongMeanings on hydrate failed', e); }
       // 同步注入给 data.js 的 lookup
@@ -474,6 +482,7 @@
         state.autoSpeak = data.prefs.autoSpeak !== false;
         state.audioMuted = !!data.prefs.audioMuted;
         state.wrongFilter = data.prefs.wrongFilter || 'all';
+        state.wrongDateFilter = data.prefs.wrongDateFilter || 'all';
         state.reviewFilter = data.prefs.reviewFilter || 'all';
         if (data.prefs.activeBookId) state.activeBookId = data.prefs.activeBookId;
         if (data.prefs.spellScope) state.spellScope = data.prefs.spellScope;
@@ -1199,8 +1208,6 @@
         if (target === 'study') renderStudy();
         if (target === 'notebooks') renderBooks();
         if (target === 'wrong') renderWrong();
-        if (target === 'dict') renderDict();
-        if (target === 'article') renderArticleSelect();
         if (target === 'stats') renderStats();
         if (target === 'spell') renderSpellInit();
         if (target === 'review') renderReview();
@@ -1387,7 +1394,7 @@
     const queue = state.studyQueue.map(w => ({ word: w.word }));
     // v5.9：错词会话按「范围」独立分片，普通背诵按「单词本」分片
     const key = state.activeWrongSession
-      ? wrongStudyKey(state.wrongSessionScope || 'all')
+      ? wrongStudyKey(state.wrongSessionScope || 'all', state.wrongSessionDate || 'all')
       : state.activeBookId;
     state.lastStudy = {
       activeBookId: state.activeBookId,
@@ -1404,15 +1411,17 @@
         queue,
         // v6.2：「连续认识」计数改由全局 state.studyPass 保存（见 persist 的 passRule）
         pass: { ...(state.studyPass || {}) },
-        wrongFilter: state.activeWrongSession ? (state.wrongSessionScope || 'all') : null
+        wrongFilter: state.activeWrongSession ? (state.wrongSessionScope || 'all') : null,
+        wrongDate: state.activeWrongSession ? (state.wrongSessionDate || 'all') : null
       };
     }
     persist();
   }
 
-  /** 错词复习进度的分片 key */
-  function wrongStudyKey(scope) {
-    return 'wrong|' + (scope || 'all');
+  /** 错词复习进度的分片 key（v6.15：带上日期，切日期/切词本互不覆盖） */
+  function wrongStudyKey(scope, dateFilter) {
+    const d = dateFilter || state.wrongSessionDate || 'all';
+    return 'wrong|' + (scope || 'all') + (d !== 'all' ? '|date:' + d : '');
   }
 
   function renderStudyCard() {
@@ -1487,7 +1496,7 @@
         <div class="study-empty">
           <div class="icon">✅</div>
           <h3>本轮完成！</h3>
-          <p>答对一遍即可通过，通过后不再出现；<b>点不认识会立即加入错词本</b>，该词需要<b>再连续认识 2 次</b>才算过（中途再点不认识则重新数）。错词本需累计答对 3 次才毕业。</p>
+          <p>答对一遍即可通过，通过后不再出现；<b>点不认识会立即加入错词本</b>，该词需要<b>再连续认识 2 次</b>才算过（中途再点不认识则重新数）。错词会一直留在错词本里，按出错日期归档。</p>
           <div style="margin-top:18px" class="row gap wrap">
             <button class="btn" id="restartRound">再走一遍（错词优先）</button>
             <button class="btn primary" id="goWrong2">复习错词本</button>
@@ -1621,15 +1630,11 @@
         book.progress.mastered.add(word.word);
         const wrong = state.wrongBook.find(w => w.word === word.word);
         if (wrong) {
+          // v6.15：只累计答对次数，错词不会因为写对而消失
           wrong.correctCount = (wrong.correctCount || 0) + 1;
           wrong.lastSeen = Date.now();
           ensureSrs(wrong);
-          if (wrong.correctCount >= 3) {
-            state.wrongBook = state.wrongBook.filter(w => w.word !== word.word);
-            toast(`「${word.word}」通过 ✓ 并从错词本毕业！`);
-          } else {
-            toast(`「${word.word}」通过 ✓ · 错词本累计 ${wrong.correctCount}/3`);
-          }
+          toast(`「${word.word}」通过 ✓ · 错词本累计答对 ${wrong.correctCount} 次`);
         } else {
           toast(`「${word.word}」认识，通过 ✓`);
         }
@@ -1637,7 +1642,7 @@
         // 这个词之前答错过 → 还要连续答对 r.remaining 次，卡片重新排回队尾
         state.studyQueue.push(word);
         const wrong = state.wrongBook.find(w => w.word === word.word);
-        toast(`「${word.word}」已认识 ${r.streak}/${r.need} · 还要再连续答对 ${r.remaining} 次才算过${wrong ? `（错词本 ${wrong.correctCount || 0}/3）` : ''}`);
+        toast(`「${word.word}」已认识 ${r.streak}/${r.need} · 还要再连续答对 ${r.remaining} 次才算过${wrong ? `（错词本累计 ${wrong.correctCount || 0} 次）` : ''}`);
       }
     } else {
       // 不认识 → 计数清零、立即进错词本，并把词卡重新排回队尾
@@ -1677,6 +1682,9 @@
       existing.lastSeen = Date.now();
       existing.type = type || existing.type || entry.type || window.VocabData.detectType(word);
       if (m) existing.meaning = m;
+      // v6.15：又错了 → 归到今天的错词本（同一个词只留一条，跟着最近一次出错走）
+      existing.date = todayKey();
+      existing.correctCount = 0;
     } else {
       const srs = newSrsRecord();
       srs.nextReview = Date.now() + SRS_INTERVALS[0] * DAY_MS;
@@ -1687,17 +1695,21 @@
         meaning: m,
         correctCount: 0,
         sources: [sourceBookId],
+        date: todayKey(),
+        addedAt: Date.now(),
         lastSeen: Date.now(),
-        createdAt: Date.now(),
         srs
       });
     }
+    // 超过 30 个日期 → 自动淘汰最早的那天
+    pruneWrongDates();
   }
 
   /** 进入错词复习会话；scope 决定"只复习哪一部分错词"（all | book:<id> | orphans） */
-  function startWrongSession(scope) {
+  function startWrongSession(scope, dateFilter) {
     const s = scope || state.wrongFilter || 'all';
     state.wrongSessionScope = s;
+    state.wrongSessionDate = dateFilter || state.wrongDateFilter || 'all';
     state.activeWrongSession = true;
     state.studyQueue = [];
     state.studyIndex = 0;
@@ -1713,26 +1725,22 @@
     renderStudy();
   }
 
-  /** 按范围过滤错词（语法与错词本页面一致：all | book:<id> | orphans） */
-  function filterWrongByScope(list, scope) {
-    if (!scope || scope === 'all') return list;
-    if (scope === 'orphans') return list.filter(w => !w.sources || !w.sources.length);
-    if (scope.startsWith('book:')) {
-      const id = scope.slice(5);
-      return list.filter(w => w.sources && w.sources.includes(id));
-    }
-    return list;
+  /** 按「单词本 + 日期」过滤错词（scope: all | book:<id> | orphans；date: all | YYYY-MM-DD） */
+  function filterWrongByScope(list, scope, dateFilter) {
+    return list.filter(w => wrongMatches(w, scope, dateFilter));
   }
 
   /** 错词范围的可读名称 */
-  function wrongScopeLabel(scope) {
-    if (!scope || scope === 'all') return '全部错词';
-    if (scope === 'orphans') return '未归类';
-    if (scope.startsWith('book:')) {
+  function wrongScopeLabel(scope, dateFilter) {
+    let base;
+    if (!scope || scope === 'all') base = '全部错词';
+    else if (scope === 'orphans') base = '未归类';
+    else if (scope.startsWith('book:')) {
       const b = state.books.find(x => x.id === scope.slice(5));
-      return b ? `《${b.name}》` : '（已删除词本）';
-    }
-    return scope;
+      base = b ? `《${b.name}》` : '（已删除词本）';
+    } else base = scope;
+    if (dateFilter && dateFilter !== 'all') base += ' · ' + wrongDateLabel(dateFilter);
+    return base;
   }
 
   /** 错词复习：释义取「错词本自身 meaning」优先，其次 DICT 拼装 */
@@ -1754,17 +1762,19 @@
 
   function renderWrongSession() {
     const area = $('#studyArea');
-    const allWrong = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+    // v6.15：错词不再"毕业"，所有错词都留在错词本里，按当前「单词本 + 日期」筛选复习
     const scope = state.wrongSessionScope || 'all';
-    const due = filterWrongByScope(allWrong, scope);
+    const dateFilter = state.wrongSessionDate || 'all';
+    const due = filterWrongByScope(state.wrongBook, scope, dateFilter);
+    const sessionKey = wrongStudyKey(scope, dateFilter);
 
     if (!due.length) {
       endCardAudio();
       area.innerHTML = `
         <div class="study-empty">
           <div class="icon">🌟</div>
-          <h3>「${escapeHtml(wrongScopeLabel(scope))}」范围内没有待复习的错词</h3>
-          <p>该范围的错词都已达到"认识 3 次"毕业标准，或本来就没有错词。</p>
+          <h3>「${escapeHtml(wrongScopeLabel(scope, dateFilter))}」范围内没有错词</h3>
+          <p>换个日期或单词本看看，或先去背诵 / 拼写积累错词。</p>
           <div style="margin-top:18px" class="row gap wrap">
             <button class="btn primary" id="backNormal">回到单词本</button>
             <button class="btn" id="wrongScopeSwitch">🔄 更换范围</button>
@@ -1783,10 +1793,12 @@
     }
 
     // —— 队列准备：内存中的队列若仍属于同一范围则直接续用 ——
-    const saved = state.lastStudyMap && (state.lastStudyMap[wrongStudyKey(scope)] || state.lastStudyMap['wrong']);
-    const savedMatches = saved && (saved.wrongFilter || 'all') === scope;
+    const saved = state.lastStudyMap && (state.lastStudyMap[sessionKey]
+      || (dateFilter === 'all' ? state.lastStudyMap[wrongStudyKey(scope, 'all')] : null));
+    const savedMatches = saved && (saved.wrongFilter || 'all') === scope
+      && (saved.wrongDate || 'all') === dateFilter;
     const inMemoryOk = state.studyQueue && state.studyQueue.length
-      && state._wrongQueueScope === scope
+      && state._wrongQueueScope === sessionKey
       && state.studyIndex < state.studyQueue.length;
 
     if (!inMemoryOk) {
@@ -1808,9 +1820,9 @@
         state.studyIndex = 0;
         state.studyRevealed = false;
       }
-      state._wrongQueueScope = scope;
+      state._wrongQueueScope = sessionKey;
       state.wrongSpellAnswered = false;
-      // v6.2：错词复习走它自己的「累计答对 3 次毕业」逻辑，不动单词本的通过规则记录
+      // 错词复习只累计答对次数，不影响单词本的通过规则
       saveLastStudy();
     }
 
@@ -1821,7 +1833,7 @@
         <div class="study-empty">
           <div class="icon">✅</div>
           <h3>本轮错词复习完成！</h3>
-          <p>范围「${escapeHtml(wrongScopeLabel(scope))}」本轮已全部过一遍，继续练可再来一轮。</p>
+          <p>「${escapeHtml(wrongScopeLabel(scope, dateFilter))}」本轮已全部过一遍，继续练可再来一轮。错词都还在，写对不会自动移出。</p>
           <div style="margin-top:18px" class="row gap wrap">
             <button class="btn primary" id="wrongRoundAgain">🔁 再来一轮</button>
             <button class="btn" id="exitWrong">退出错词复习</button>
@@ -1852,17 +1864,25 @@
     const meaning = wrongItemMeaning(w, entry);
     const mode = state.wrongCardMode === 'spell' ? 'spell' : 'recall';
 
-    // 顶部：范围选择（可随时更换单词本一起做）
-    const scopeOpts = ['<option value="all">📚 全部错词</option>']
+    // 顶部：范围选择（单词本 + 日期，可随时更换）
+    const scopedByDate = state.wrongBook.filter(x => wrongMatches(x, 'all', dateFilter));
+    const scopeOpts = ['<option value="all">📚 全部单词本</option>']
       .concat(state.books.map(b => {
-        const c = state.wrongBook.filter(x => (x.correctCount || 0) < 3 && x.sources && x.sources.includes(b.id)).length;
+        const c = scopedByDate.filter(x => x.sources && x.sources.includes(b.id)).length;
         return `<option value="book:${b.id}" ${scope === 'book:' + b.id ? 'selected' : ''}>《${escapeHtml(b.name)}》(${c})</option>`;
       }));
-    const orphanAll = state.wrongBook.filter(x => (x.correctCount || 0) < 3 && (!x.sources || !x.sources.length)).length;
+    const orphanAll = scopedByDate.filter(x => !x.sources || !x.sources.length).length;
     if (orphanAll) scopeOpts.push(`<option value="orphans" ${scope === 'orphans' ? 'selected' : ''}>📦 未归类（${orphanAll}）</option>`);
 
+    const dateOpts = ['<option value="all">📅 全部日期</option>'].concat(
+      wrongDates().map(d => {
+        const n = state.wrongBook.filter(x => wrongDateOf(x) === d).length;
+        return `<option value="${d}" ${dateFilter === d ? 'selected' : ''}>${escapeHtml(wrongDateLabel(d))}（${n}）</option>`;
+      })
+    );
+
     $('#studyTitle').textContent = '错词本复习';
-    $('#studySub').textContent = `范围：${wrongScopeLabel(scope)} · 待毕业 ${due.length} 个 · 本词进度 ${correctCount}/3`;
+    $('#studySub').textContent = `范围：${wrongScopeLabel(scope, dateFilter)} · 共 ${due.length} 个错词 · 本词累计答对 ${correctCount} 次`;
 
     const pct = (state.studyIndex / state.studyQueue.length) * 100;
     const spellAnswered = !!state.wrongSpellAnswered;
@@ -1875,9 +1895,11 @@
       </div>
 
       <div class="card" style="padding:10px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
-        <span class="muted small">复习范围：</span>
+        <span class="muted small">单词本：</span>
         <select id="wrongScopeSelect" class="select" style="min-width:170px">${scopeOpts.join('')}</select>
-        <span class="muted small">答对 3 次即毕业</span>
+        <span class="muted small">日期：</span>
+        <select id="wrongDateSelect" class="select" style="min-width:150px">${dateOpts.join('')}</select>
+        <span class="muted small">写对只累计次数，不会移出错词本</span>
         <span class="grow"></span>
         <button class="btn small-btn ${mode === 'spell' ? 'primary' : ''}" id="wrongModeToggle">
           ${mode === 'spell' ? '🎴 改回认词模式' : '✍ 拼写这道题'}
@@ -1889,7 +1911,7 @@
           ${Speech.button(w.word, { small: true })}
           <button class="edit-btn" id="editCardBtn" title="修正这个词的释义">✏ 编辑</button>
         </div>
-        <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · ${correctCount}/3 · ${typeTag}</div>
+        <div class="progress">${state.studyIndex + 1} / ${state.studyQueue.length} · 累计答对 ${correctCount} 次 · ${typeTag}</div>
 
         ${mode === 'recall' ? `
           <div class="word ${w.type === 'sentence' ? 'sentence' : (w.type === 'phrase' ? 'phrase' : '')}">${escapeHtml(w.word)}</div>
@@ -1942,7 +1964,7 @@
       ${mode === 'recall' && state.studyRevealed ? `
         <div class="actions">
           <button class="btn unknow" id="btnUnknow">不认识</button>
-          <button class="btn know" id="btnKnow">认识 +1 (${correctCount + 1}/3)</button>
+          <button class="btn know" id="btnKnow">认识 +1（累计 ${correctCount + 1} 次）</button>
         </div>
       ` : ''}
       ${mode === 'spell' && spellAnswered ? `
@@ -1966,9 +1988,18 @@
       toast('🔊 已开启自动英式朗读 · 点 🔊 可单独再读 · 顶部 🔊 可一键静音');
     }
 
-    // —— 范围切换：整轮进度按新范围重新开始，但各范围进度各自保留 ——
+    // —— 范围 / 日期切换：整轮进度按新范围重新开始，但各范围进度各自保留 ——
     $('#wrongScopeSelect').addEventListener('change', (e) => {
       state.wrongSessionScope = e.target.value;
+      state.studyQueue = [];
+      state.studyIndex = 0;
+      state.studyRevealed = false;
+      state.wrongSpellAnswered = false;
+      state._wrongQueueScope = null;
+      renderWrongSession();
+    });
+    $('#wrongDateSelect').addEventListener('change', (e) => {
+      state.wrongSessionDate = e.target.value;
       state.studyQueue = [];
       state.studyIndex = 0;
       state.studyRevealed = false;
@@ -2005,7 +2036,7 @@
             wrong.lastSeen = Date.now();
             nextReviewAfter(ensureSrs(wrong), false);
           } else {
-            // 该词可能刚毕业又被判不认识 → 重新拉回错词本
+            // 兜底：若错词本里没有这条（被手动清空过），重新拉回今天的错词本
             addToWrongBook(w.word, w.type, (w.sources && w.sources[0]) || w.sourceBookId, w.meaning);
           }
           persist();
@@ -2019,17 +2050,11 @@
         });
         $('#btnKnow').addEventListener('click', () => {
           if (wrong) {
+            // v6.15：只累计答对次数，不再"答对 3 次毕业"；错词留在原日期里
             wrong.correctCount = (wrong.correctCount || 0) + 1;
             wrong.lastSeen = Date.now();
             nextReviewAfter(ensureSrs(wrong), true);
-            if (wrong.correctCount >= 3) {
-              state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
-              // v6：毕业了就把它在本轮队列里还没轮到的副本一并清掉
-              state.studyQueue = state.studyQueue.filter((x, i) => i < state.studyIndex || x.word !== w.word);
-              toast(`「${w.word}」已毕业！`);
-            } else {
-              toast(`「${w.word}」进度 ${wrong.correctCount}/3`);
-            }
+            toast(`「${w.word}」✓ 累计答对 ${wrong.correctCount} 次`);
           }
           persist();
           state.studyIndex++;
@@ -2062,20 +2087,16 @@
           state.wrongSpellInput = v || '（空）';
           if (wrong) {
             if (ok) {
+              // v6.15：拼对也只累计次数，不毕业、不删除
               wrong.correctCount = (wrong.correctCount || 0) + 1;
               wrong.lastSeen = Date.now();
               nextReviewAfter(ensureSrs(wrong), true);
-              if (wrong.correctCount >= 3) {
-                state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
-                toast(`「${w.word}」已毕业！`);
-              } else {
-                toast(`✓ 拼对了 ·「${w.word}」进度 ${wrong.correctCount}/3`);
-              }
+              toast(`✓ 拼对了 ·「${w.word}」累计答对 ${wrong.correctCount} 次`);
             } else {
               wrong.correctCount = 0;
               wrong.lastSeen = Date.now();
               nextReviewAfter(ensureSrs(wrong), false);
-              toast(`✗ 拼错了，「${w.word}」进度已重置`);
+              toast(`✗ 拼错了，「${w.word}」累计次数已归零`);
             }
           }
           persist();
@@ -2125,10 +2146,12 @@
     // v6.3：重置进度 —— 清空该本的已掌握 + 连续计数，可以重新学一遍
     $('#restartBook').addEventListener('click', () => resetStudyProgress());
     $('#studyWrong').addEventListener('click', () => {
-      // v5.9：只复习「错词本页面当前选中范围」的错词（跟随上方下拉）
+      // v5.9：只复习「错词本页面当前选中范围」的错词（跟随上方两个下拉）
       const picker = $('#wrongBookPicker');
       const scope = (picker && picker.value) ? picker.value : (state.wrongFilter || 'all');
+      const datePicker = $('#wrongDatePicker');
       state.wrongFilter = scope;
+      state.wrongDateFilter = (datePicker && datePicker.value) ? datePicker.value : (state.wrongDateFilter || 'all');
       startWrongSession(scope);
     });
   }
@@ -2706,6 +2729,7 @@
       prefs: {
         autoSpeak: state.autoSpeak,
         wrongFilter: state.wrongFilter,
+        wrongDateFilter: state.wrongDateFilter,
         reviewFilter: state.reviewFilter,
         activeBookId: state.activeBookId,
         spellScope: state.spellScope,
@@ -3104,13 +3128,12 @@
           <p class="muted small">检测到备份内容：</p>
           <ul class="muted small" style="line-height:1.8;padding-left:18px">
             <li>单词本：<b>${incBooks.length}</b> 个，共 <b>${totalWords}</b> 词</li>
-            <li>错词：<b>${incWrong.length}</b> 条${incUserDict ? ` · 含 <b>${Object.keys(incUserDict).length}</b> 个用户字典` : ''}</li>
+            <li>错词：<b>${incWrong.length}</b> 条${incUserDict ? ` · 含 <b>${Object.keys(incUserDict).length}</b> 个自定义释义` : ''}</li>
             ${incLastStudy ? `<li>包含上次背诵进度（${escapeHtml(incLastStudy.bookName || '')}）</li>` : ''}
             ${incLastSpell ? `<li>包含上次拼写进度</li>` : ''}
           </ul>
           <p class="muted small">请选择恢复方式（<b>合并</b>更安全，不会清空你现有的数据）：</p>
           <div class="row gap wrap" style="margin-top:14px;justify-content:flex-end">
-            <button class="btn ghost" data-act="merge-dict" title="只补充用户字典（不影响单词本/错词）">仅导入字典</button>
             <button class="btn" data-act="replace">覆盖现有</button>
             <button class="btn primary" data-act="merge">合并</button>
           </div>
@@ -3124,17 +3147,6 @@
       if (e.target === modal) close();
       if (e.target.matches('[data-act=cancel]')) close();
     });
-
-    // 仅导入字典（最安全：不动 books/wrongBook/progress）
-    modal.querySelector('[data-act=merge-dict]').onclick = () => {
-      close();
-      if (!incUserDict) { toast('此备份不含用户字典，跳过'); return; }
-      Object.assign(state.userDict, incUserDict);
-      window.VocabData.setUserDict(state.userDict);
-      persist();
-      renderBooks();
-      toast(`✅ 已合并 ${Object.keys(incUserDict).length} 个用户字典释义`);
-    };
 
     // 覆盖现有（替换所有数据为导入内容，会清空当前所有进度）
     modal.querySelector('[data-act=replace]').onclick = () => {
@@ -3268,7 +3280,6 @@
     renderWrong();
     renderSpellInit();
     renderReview();
-    renderDict();
     if (typeof renderStats === 'function') renderStats();
     toast('📥 导入完成。回到首页或「单词本」tab 即可看到新内容。');
   }
@@ -3334,78 +3345,162 @@
       word: w.word,
       type: w.type || window.VocabData.detectType(w.word),
       entry: w.entry || {},
+      meaning: w.meaning || '',
       correctCount: typeof w.correctCount === 'number' ? w.correctCount : 0,
       sources: Array.from(new Set(w.sources || [])),
+      date: wrongDateOf(w),
+      addedAt: w.addedAt || w.createdAt || w.lastSeen || Date.now(),
       lastSeen: w.lastSeen || Date.now(),
       srs: w.srs || newSrsRecord()
     };
   }
 
-  /* ---------- 6. 错词本 ---------- */
+  /* ---------- 5.5 v6.15：错词按日期归档 ---------- */
+  // 规则：同一个词只留一条记录，日期 = 最近一次出错的那天。
+  //      错词不会因为写对而消失，只保留最近 30 个「有错词的日期」（不是 30 天），
+  //      超过时自动丢掉最早的那个日期。
+  const WRONG_DATE_LIMIT = 30;
+
+  /** 本地日期键 YYYY-MM-DD（按本地时区算，避免晚上 8 点后错词跑到"昨天"） */
+  function dateKey(ts) {
+    const d = ts ? new Date(ts) : new Date();
+    const t = isNaN(d.getTime()) ? new Date() : d;
+    return t.getFullYear() + '-'
+      + String(t.getMonth() + 1).padStart(2, '0') + '-'
+      + String(t.getDate()).padStart(2, '0');
+  }
+  function todayKey() { return dateKey(); }
+
+  /** 这条错词属于哪个日期（老数据没有 date 字段时，用 lastSeen / createdAt 推算） */
+  function wrongDateOf(w) {
+    if (w && /^\d{4}-\d{2}-\d{2}$/.test(String(w.date || ''))) return w.date;
+    return dateKey((w && (w.addedAt || w.createdAt || w.lastSeen)) || Date.now());
+  }
+
+  function wrongDateLabel(key) {
+    if (key === todayKey()) return '今天 · ' + key;
+    const y = new Date(); y.setDate(y.getDate() - 1);
+    if (key === dateKey(y)) return '昨天 · ' + key;
+    return key;
+  }
+
+  /** 所有「有错词的日期」，新 → 旧 */
+  function wrongDates() {
+    return Array.from(new Set(state.wrongBook.map(wrongDateOf))).sort().reverse();
+  }
+
+  /** 只保留最近 WRONG_DATE_LIMIT 个日期；返回被清掉的词数 */
+  function pruneWrongDates() {
+    const dates = wrongDates();
+    if (dates.length <= WRONG_DATE_LIMIT) return 0;
+    const keep = new Set(dates.slice(0, WRONG_DATE_LIMIT));
+    const before = state.wrongBook.length;
+    state.wrongBook = state.wrongBook.filter(w => keep.has(wrongDateOf(w)));
+    return before - state.wrongBook.length;
+  }
+
+  /** 错词是否命中「单词本 + 日期」两个筛选条件 */
+  function wrongMatches(w, filter, dateFilter) {
+    if (dateFilter && dateFilter !== 'all' && wrongDateOf(w) !== dateFilter) return false;
+    if (!filter || filter === 'all') return true;
+    if (filter === 'orphans') return !w.sources || !w.sources.length;
+    if (String(filter).startsWith('book:')) {
+      const id = filter.slice(5);
+      return !!(w.sources && w.sources.includes(id));
+    }
+    if (String(filter).startsWith('date:')) return wrongDateOf(w) === filter.slice(5);
+    return true;
+  }
+
+  /* ---------- 6. 错词本（v6.15：按日期归档 + 日期内按单词本分类） ---------- */
   function renderWrong() {
-    // 渲染下拉
-    const picker = $('#wrongBookPicker');
-    if (picker) {
-      const opts = ['<option value="all">📚 全部错词</option>'];
-      for (const b of state.books) {
-        const count = state.wrongBook.filter(w => w.sources && w.sources.includes(b.id) && (w.correctCount || 0) < 3).length;
-        opts.push(`<option value="book:${b.id}">《${escapeHtml(b.name)}》(${count})</option>`);
+    // 先确定单词本筛选（词本可能已被删除 → 回到全部）；日期选项的计数要跟着它走
+    const filterOk = state.wrongFilter === 'all' || state.wrongFilter === 'orphans'
+      || state.books.some(b => 'book:' + b.id === state.wrongFilter);
+    if (!filterOk) state.wrongFilter = 'all';
+    const filter = state.wrongFilter || 'all';
+    const scopedByFilter = state.wrongBook.filter(w => wrongMatches(w, filter, 'all'));
+    const dates = Array.from(new Set(scopedByFilter.map(wrongDateOf))).sort().reverse();
+
+    const dateFilter = state.wrongDateFilter || 'all';
+
+    /* —— ① 日期下拉 —— */
+    const datePicker = $('#wrongDatePicker');
+    if (datePicker) {
+      // 选中的日期在当前单词本下没有错词（或已被 30 日期上限淘汰）→ 回到「全部日期」
+      if (dateFilter !== 'all' && !dates.includes(dateFilter)) state.wrongDateFilter = 'all';
+      const cur = state.wrongDateFilter || 'all';
+      const opts = [`<option value="all">📅 全部日期（${dates.length} 个）</option>`];
+      for (const d of dates) {
+        const n = scopedByFilter.filter(w => wrongDateOf(w) === d).length;
+        opts.push(`<option value="${d}">${escapeHtml(wrongDateLabel(d))}（${n}）</option>`);
       }
-      const orphanCount = state.wrongBook.filter(w => !w.sources || !w.sources.length).length;
-      opts.push(`<option value="orphans">📦 未归类（${orphanCount}）</option>`);
-      picker.innerHTML = opts.join('');
-      picker.value = state.wrongFilter || 'all';
-      picker.onchange = () => {
-        state.wrongFilter = picker.value;
+      datePicker.innerHTML = opts.join('');
+      datePicker.value = cur;
+      datePicker.onchange = () => {
+        state.wrongDateFilter = datePicker.value || 'all';
         persist();
         renderWrong();
       };
     }
 
-    // 按下拉过滤
-    const filter = state.wrongFilter || 'all';
-    const items = state.wrongBook.filter(w => {
-      if ((w.correctCount || 0) >= 3) return false; // 已毕业的隐藏
-      if (filter === 'all') return true;
-      if (filter === 'orphans') return !w.sources || !w.sources.length;
-      if (filter.startsWith('book:')) {
-        const id = filter.slice(5);
-        return w.sources && w.sources.includes(id);
+    /* —— ② 单词本下拉（计数跟随上面选的日期） —— */
+    const activeDate = state.wrongDateFilter || 'all';
+    const inDate = state.wrongBook.filter(w => activeDate === 'all' || wrongDateOf(w) === activeDate);
+    const picker = $('#wrongBookPicker');
+    if (picker) {
+      const opts = [`<option value="all">📚 全部单词本（${inDate.length}）</option>`];
+      for (const b of state.books) {
+        const count = inDate.filter(w => w.sources && w.sources.includes(b.id)).length;
+        opts.push(`<option value="book:${b.id}">《${escapeHtml(b.name)}》（${count}）</option>`);
       }
-      return true;
-    });
+      const orphanCount = inDate.filter(w => !w.sources || !w.sources.length).length;
+      if (orphanCount) opts.push(`<option value="orphans">📦 未归类（${orphanCount}）</option>`);
+      picker.innerHTML = opts.join('');
+      picker.value = filter;
+      picker.onchange = () => {
+        state.wrongFilter = picker.value || 'all';
+        persist();
+        renderWrong();
+      };
+    }
 
-    // 更新「清空错词」按钮的文案，按当前过滤范围区分
-    updateClearWrongButton(filter, items.length);
+    const items = state.wrongBook.filter(w => wrongMatches(w, filter, activeDate));
 
-    // v5.9：让「开始复习错词」按钮明确显示将复习的范围
+    // 「清空错词」按钮：清的是当前「日期 + 单词本」筛选出来的这一批
+    updateClearWrongButton(filter, items.length, activeDate);
+
     const swBtn = $('#studyWrong');
     if (swBtn) {
-      const label = wrongScopeLabel(filter);
-      swBtn.textContent = items.length
-        ? `开始复习错词（${label} · ${items.length}）`
-        : `开始复习错词（${label}）`;
+      const label = wrongScopeLabel(filter, activeDate);
+      swBtn.textContent = `开始复习错词（${label} · ${items.length}）`;
     }
 
-    // 分组（按单词本），便于一眼看到"这本词本欠我多少"
-    const groups = {};
-    for (const w of items) {
-      const groupKey = (w.sources && w.sources.length)
-        ? w.sources.map(id => state.books.find(b => b.id === id)?.name || '已删除词本').join('、')
-        : '未归类';
-      if (!groups[groupKey]) groups[groupKey] = [];
-      groups[groupKey].push(w);
-    }
     const list = $('#wrongList');
     if (!items.length) {
-      list.innerHTML = `<div class="muted">当前筛选下没有错词。每当你标记"不认识"就会出现在这里。</div>`;
+      list.innerHTML = `<div class="muted">${
+        state.wrongBook.length
+          ? '当前筛选下没有错词，换个日期或单词本看看。'
+          : '错词本还是空的。背诵 / 听音点「不认识」、拼写拼错，就会自动归到当天的错词本里。'
+      }</div>`;
       return;
     }
 
+    /* —— ③ 分组：先日期（新→旧），日期内再按单词本 —— */
+    const byDate = new Map();
+    for (const w of items) {
+      const d = wrongDateOf(w);
+      if (!byDate.has(d)) byDate.set(d, []);
+      byDate.get(d).push(w);
+    }
+    const dateKeys = Array.from(byDate.keys()).sort().reverse();
+    const bookNameOf = (id) => {
+      const b = state.books.find(x => x.id === id);
+      return b ? `《${b.name}》` : '（已删除的单词本）';
+    };
+
     const renderRow = (w) => {
       const e = w.entry || window.VocabData.lookup(w.word);
-      const progress = Math.min(w.correctCount || 0, 3);
-      const pct = (progress / 3) * 100;
       const typeTag = renderTypeTag(w.type || e.type || window.VocabData.detectType(w.word));
       const next = w.srs ? new Date(w.srs.nextReview).toLocaleDateString('zh-CN') : '—';
       return `
@@ -3417,12 +3512,10 @@
               ${typeTag}
               <span class="muted small" style="margin-left:6px">${escapeHtml(e.phonetic || '')}</span>
             </div>
-            <div class="meta">${escapeHtml((e.pos || '') + (e.pos ? ' ' : '') + (e.cn || ''))}</div>
-            <div class="meta small">下次复习：${next} · 阶梯 ${w.srs?.repetitions || 0}/${SRS_INTERVALS.length}</div>
+            <div class="meta">${escapeHtml(wrongItemMeaning(w, e))}</div>
+            <div class="meta small">收词 ${escapeHtml(wrongDateOf(w))} · 累计答对 ${w.correctCount || 0} 次 · 下次复习：${next}</div>
           </div>
           <div class="row gap">
-            <span class="progress-mini"><span style="width:${pct}%"></span></span>
-            <span class="meta">${progress}/3</span>
             <button class="btn" data-act="edit" data-word="${escapeHtml(w.word)}">编辑</button>
             <button class="btn danger" data-act="del" data-word="${escapeHtml(w.word)}">移除</button>
           </div>
@@ -3430,17 +3523,38 @@
       `;
     };
 
-    // 全局 / 某本 → 是否分组渲染
-    if (filter === 'all' && Object.keys(groups).length > 1) {
-      list.innerHTML = Object.entries(groups).map(([g, arr]) => `
-        <div style="grid-column:1/-1">
-          <h3 class="muted" style="font-size:13px;margin:14px 0 6px">📕 ${escapeHtml(g)} <span class="muted small">${arr.length} 个</span></h3>
-          <div class="grid">${arr.map(renderRow).join('')}</div>
+    list.innerHTML = `
+      <div class="wrong-summary">
+        共 <b>${items.length}</b> 个错词 · 分布在 <b>${dates.length}</b> 个日期 ·
+        只保留最近 <b>${WRONG_DATE_LIMIT}</b> 个日期，超出时自动删除最早的那一天
+      </div>
+    ` + dateKeys.map(d => {
+      const arr = byDate.get(d);
+      const sub = new Map();
+      for (const w of arr) {
+        const key = (w.sources && w.sources.length)
+          ? w.sources.map(bookNameOf).join('、')
+          : '未归类';
+        if (!sub.has(key)) sub.set(key, []);
+        sub.get(key).push(w);
+      }
+      return `
+        <div class="wrong-date-group">
+          <div class="wrong-date-head">
+            <span class="wrong-date-title">📅 ${escapeHtml(wrongDateLabel(d))}</span>
+            <span class="muted small">${arr.length} 个</span>
+            <span class="grow"></span>
+            <button class="btn ghost danger small-btn" data-clear-date="${d}">清空这一天</button>
+          </div>
+          ${Array.from(sub.entries()).map(([bookName, rows]) => `
+            <div class="wrong-book-head">📕 ${escapeHtml(bookName)} <span class="muted small">${rows.length} 个</span></div>
+            <div class="grid">${rows.map(renderRow).join('')}</div>
+          `).join('')}
         </div>
-      `).join('');
-    } else {
-      list.innerHTML = items.map(renderRow).join('');
-    }
+      `;
+    }).join('');
+
+    // 单条操作
     list.querySelectorAll('button[data-act]').forEach(btn => {
       btn.addEventListener('click', () => {
         const word = btn.dataset.word;
@@ -3450,14 +3564,29 @@
           state.wrongBook = state.wrongBook.filter(x => x.word !== word);
           persist();
           renderWrong();
+          toast(`已移除「${word}」`);
         } else if (btn.dataset.act === 'edit') {
           openEditModal({
             word,
-            meaning: `${item.entry?.pos || ''} ${item.entry?.cn || ''}`.trim(),
+            meaning: wrongItemMeaning(item, item.entry || window.VocabData.lookup(word)),
             example: item.entry?.example || '',
             scope: 'word'
           });
         }
+      });
+    });
+
+    // 整日清空
+    list.querySelectorAll('[data-clear-date]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const d = btn.dataset.clearDate;
+        const n = state.wrongBook.filter(w => wrongDateOf(w) === d).length;
+        if (!n) return;
+        if (!confirm(`清空 ${wrongDateLabel(d)} 的错词（${n} 个）？其他日期不受影响。`)) return;
+        state.wrongBook = state.wrongBook.filter(w => wrongDateOf(w) !== d);
+        persist();
+        renderWrong();
+        toast(`已清空 ${wrongDateLabel(d)} 的错词`);
       });
     });
   }
@@ -3465,100 +3594,59 @@
   function bindWrong() {
     $('#clearWrong').addEventListener('click', () => {
       const filter = state.wrongFilter || 'all';
-      const count = state.wrongBook.filter(w => {
-        if ((w.correctCount || 0) >= 3) return false;
-        if (filter === 'all') return true;
-        if (filter === 'orphans') return !w.sources || !w.sources.length;
-        if (filter.startsWith('book:')) {
-          const id = filter.slice(5);
-          return w.sources && w.sources.includes(id);
-        }
-        return true;
-      }).length;
-      if (!count) { toast('当前范围没有可清空的错词'); return; }
+      const dateFilter = state.wrongDateFilter || 'all';
+      const hit = state.wrongBook.filter(w => wrongMatches(w, filter, dateFilter));
+      if (!hit.length) { toast('当前筛选下没有可清空的错词'); return; }
 
-      let confirmMsg;
-      if (filter === 'all') {
-        confirmMsg = `确定清空全部错词（${count} 个）？此操作不可撤销。`;
-      } else if (filter === 'orphans') {
-        confirmMsg = `确定清空未归类的错词（${count} 个）？其他单词本的错词不受影响。`;
-      } else if (filter.startsWith('book:')) {
-        const id = filter.slice(5);
-        const book = state.books.find(b => b.id === id);
-        const bookName = book ? `《${book.name}》` : '该单词本';
-        // 计算多来源会被影响但不会被清掉的数量
-        const multiSourceCount = state.wrongBook.filter(w =>
-          w.sources && w.sources.includes(id) && w.sources.length > 1
-        ).length;
-        if (multiSourceCount > 0) {
-          confirmMsg = `确定清空${bookName}的错词（${count} 个，含 ${multiSourceCount} 个多来源词 —— 会从这些词中移除「${bookName}」来源，但不会彻底删除这些词本身）？`;
-        } else {
-          confirmMsg = `确定清空${bookName}的错词（${count} 个）？其他单词本的错词不受影响。`;
-        }
-      }
-      if (!confirm(confirmMsg)) return;
+      const where = [];
+      if (dateFilter !== 'all') where.push(wrongDateLabel(dateFilter));
+      if (filter !== 'all') where.push(wrongScopeLabel(filter));
+      const scopeText = where.length ? where.join(' · ') : '全部错词';
+
+      // 多来源词：只摘掉被清词本的来源，不彻底删除
+      const multiSource = filter.startsWith('book:')
+        ? hit.filter(w => w.sources && w.sources.length > 1).length
+        : 0;
+      let msg = `确定清空「${scopeText}」的错词（${hit.length} 个）？此操作不可撤销。`;
+      if (multiSource) msg += `\n其中 ${multiSource} 个词还属于别的单词本，只会摘掉当前词本的来源。`;
+      if (!confirm(msg)) return;
 
       if (filter === 'all') {
-        state.wrongBook = [];
+        // 只删当前日期范围内的
+        state.wrongBook = state.wrongBook.filter(w => !wrongMatches(w, 'all', dateFilter));
       } else if (filter === 'orphans') {
-        state.wrongBook = state.wrongBook.filter(w => w.sources && w.sources.length > 0);
+        state.wrongBook = state.wrongBook
+          .map(w => (wrongMatches(w, 'orphans', dateFilter) ? null : w))
+          .filter(Boolean);
       } else if (filter.startsWith('book:')) {
         const id = filter.slice(5);
         state.wrongBook = state.wrongBook
           .map(w => {
-            if (!w.sources || !w.sources.includes(id)) return w;
-            const newSources = w.sources.filter(s => s !== id);
-            if (newSources.length === 0) return null; // 移除该词
-            return { ...w, sources: newSources };
+            if (!wrongMatches(w, filter, dateFilter)) return w;
+            const sources = (w.sources || []).filter(s => s !== id);
+            return sources.length ? { ...w, sources } : null;
           })
           .filter(Boolean);
       }
 
       persist();
-      // 同步清理 lastSpell 里对已删词的依赖（如果当前词本所有词被清完）
       renderWrong();
-      toast('已按当前范围清空错词');
+      toast(`已清空「${scopeText}」的错词`);
     });
   }
 
-  /** 根据当前过滤范围，动态更新"清空错词本"按钮的文案，避免误操作 */
-  function updateClearWrongButton(filter, count) {
+  /** 根据当前「日期 + 单词本」筛选范围，动态更新"清空错词"按钮的文案，避免误操作 */
+  function updateClearWrongButton(filter, count, dateFilter) {
     const btn = $('#clearWrong');
     if (!btn) return;
-    let label;
-    if (filter === 'all') {
-      label = `🧹 清空全部错词（${count}）`;
-    } else if (filter === 'orphans') {
-      label = `🧹 清空未归类（${count}）`;
-    } else if (filter.startsWith('book:')) {
-      const id = filter.slice(5);
-      const book = state.books.find(b => b.id === id);
-      const name = book ? `《${book.name}》` : '该单词本';
-      label = `🧹 清空${name}（${count}）`;
-    } else {
-      label = '🧹 清空错词本';
-    }
-    btn.textContent = label;
+    const bits = [];
+    if (dateFilter && dateFilter !== 'all') bits.push(wrongDateLabel(dateFilter));
+    if (filter !== 'all') bits.push(wrongScopeLabel(filter));
+    btn.textContent = `🧹 清空${bits.length ? '「' + bits.join(' · ') + '」' : '全部错词'}（${count}）`;
     btn.disabled = count === 0;
   }
 
-  /* ---------- 7. AI 文章生成 ---------- */
-  function renderArticleSelect() {
-    const sel = $('#articleBookSelect');
-    if (!state.books.length) {
-      sel.innerHTML = `<option value="">— 暂无单词本 —</option>`;
-      $('#articleOut').innerHTML = `<div class="placeholder">还没有单词本，请先去首页导入词汇。</div>`;
-      return;
-    }
-    sel.innerHTML = state.books
-      .map(b => `<option value="${b.id}">${escapeHtml(b.name)} (${b.words.length})</option>`)
-      .join('');
-  }
-
-  function bindArticle() {
-    $('#generateArticle').addEventListener('click', generate);
-  }
-
+  /* ---------- 7. 拼写队列 ---------- */
   /* =====================================================
      12. 拼写平台
      ===================================================== */
@@ -3605,9 +3693,8 @@
       //   - 涵盖明天到期的（保证新词 / 错词也立刻能拼）
       const now = Date.now();
       const horizon = now + 1 * DAY_MS;
-      // 1. 错词本未毕业的词（最优先）
+      // 1. 错词本里的词（最优先）
       for (const w of state.wrongBook) {
-        if ((w.correctCount || 0) >= 3) continue;
         if (!w.srs) w.srs = newSrsRecord();
         if (w.srs.nextReview <= horizon) pushItem(w.word, w.type, {
           srs: w.srs, sourceBookId: null, wrong: w, meaning: w.meaning
@@ -3634,9 +3721,8 @@
         }
       }
     } else if (scope === 'wrong' || scope.startsWith('wrong:')) {
-      // 错词本：wrong = 全部未毕业错词；wrong:book:<id> = 某词本的错词；wrong:orphans = 未归类错词
+      // 错词本：wrong = 全部错词；wrong:book:<id> = 某词本的错词；wrong:orphans = 未归类错词
       for (const w of state.wrongBook) {
-        if ((w.correctCount || 0) >= 3) continue;
         if (!w.srs) w.srs = newSrsRecord();
         if (scope.startsWith('wrong:book:')) {
           const id = scope.slice('wrong:book:'.length);
@@ -3661,7 +3747,6 @@
         pushItem(w.word, w.type, { srs: w.srs, sourceBookId: b.id, meaning: w.meaning });
       }
       for (const w of state.wrongBook) {
-        if ((w.correctCount || 0) >= 3) continue;
         if (!w.srs) w.srs = newSrsRecord();
         pushItem(w.word, w.type, { srs: w.srs, sourceBookId: null, wrong: w, meaning: w.meaning });
       }
@@ -3674,7 +3759,7 @@
 
   function spellSourceLabel(scope) {
     if (scope === 'due') return '今日到期（SRS）';
-    if (scope === 'wrong') return '错词本（未毕业）';
+    if (scope === 'wrong') return '错词本';
     if (scope === 'all') return '全部条目';
     if (scope.startsWith('wrong:book:')) {
       const b = state.books.find(x => x.id === scope.slice('wrong:book:'.length));
@@ -3786,19 +3871,19 @@
     // 渲染模式 select 与初始界面
     const sel = $('#spellScopeSelect');
     const opts = ['<option value="due">今日到期（SRS）</option>',
-      '<option value="wrong">错词本（未毕业）</option>',
+      '<option value="wrong">错词本</option>',
       '<option value="all">全部条目</option>'];
     // 按词本筛选错词：每个词本一列「《书名》的错词 (N)」
     const wrongByBook = state.books
       .map(b => {
-        const n = state.wrongBook.filter(w => (w.correctCount || 0) < 3 && w.sources && w.sources.includes(b.id)).length;
+        const n = state.wrongBook.filter(w => w.sources && w.sources.includes(b.id)).length;
         return `<option value="wrong:book:${b.id}">《${escapeHtml(b.name)}》的错词 (${n})</option>`;
       })
       .join('');
     if (wrongByBook) {
       opts.push(`<optgroup label="错词本（按词本）">${wrongByBook}</optgroup>`);
     }
-    const orphans = state.wrongBook.filter(w => (w.correctCount || 0) < 3 && (!w.sources || !w.sources.length)).length;
+    const orphans = state.wrongBook.filter(w => !w.sources || !w.sources.length).length;
     if (orphans) {
       opts.push(`<option value="wrong:orphans">未归类错词 (${orphans})</option>`);
     }
@@ -3863,7 +3948,7 @@
       <div class="row between wrap gap" style="font-size:13px">
         <div>今天到期（艾宾浩斯）：<b style="color:var(--warning)">${dueToday}</b> 个</div>
         <div>本次拼写规模：<b>${total}</b> 个</div>
-        <div class="muted">拼写<b>一遍就对</b>即通过；<b>拼错一遍就进错词本</b>，且该词还要<b>再连续拼对 2 次</b>才算过（中途再错重新数）。错词本累计答对 3 次毕业。</div>
+        <div class="muted">拼写<b>一遍就对</b>即通过；<b>拼错一遍就进错词本</b>，且该词还要<b>再连续拼对 2 次</b>才算过（中途再错重新数）。错词会一直留在错词本里，按出错日期归档。</div>
       </div>
     `;
 
@@ -3918,7 +4003,7 @@
       for (const b of state.books) opts.push(`book:${b.id}`);
       sel.innerHTML = opts.map(v => {
         const label = v === 'due' ? '今日到期（SRS）'
-          : v === 'wrong' ? '错词本（未毕业）'
+          : v === 'wrong' ? '错词本'
           : v === 'all' ? '全部条目'
           : state.books.find(b => `book:${b.id}` === v)?.name || v;
         return `<option value="${v}">${escapeHtml(label)}</option>`;
@@ -4129,7 +4214,7 @@
           </div>
           <div class="muted small spell-hint">${w._lastOk
             ? (spellPass.started ? `⌨ <kbd>Enter</kbd> = 下一题 · 本词还要再连续拼对 <b>${spellPass.remaining}</b> 次才通过` : `⌨ <kbd>Enter</kbd> = 下一题 · 本词已通过`)
-            : `⌨ <kbd>Enter</kbd> = 下一题 · <b>改正</b> 后再回车会判定这次拼得对不对（拼对即计入"连续拼对"次数）· <span style="color:var(--success)">错词本累计答对 3 次毕业</span>`}</div>
+            : `⌨ <kbd>Enter</kbd> = 下一题 · <b>改正</b> 后再回车会判定这次拼得对不对（拼对即计入"连续拼对"次数）· <span style="color:var(--success)">错词会按出错日期保留在错词本里</span>`}</div>
         ` : `
           <div class="spell-feedback" id="spellFeedback"></div>
           <div class="actions">
@@ -4222,11 +4307,7 @@
             }
             if (m) w.wrong.meaning = m;
           }
-          if (w.wrong.correctCount >= 3) {
-            state.wrongBook = state.wrongBook.filter(x => x.word !== w.word);
-            toast(`「${w.word}」已从错词本毕业！`);
-            w.wrong = null;
-          }
+          // v6.15：不再按「答对 3 次」毕业，错词留在错词本里
         }
         // 同步到单词本里的 srs（如该词出自某本）
         for (const b of state.books) {
@@ -4247,7 +4328,7 @@
         const r = PassRule.miss('spell', w.key);
         // 进入错词本（首次错时新增，已存在则合并 sources）
         addToWrongBook(w.word, w.type, w.sourceBookId, w.meaning);
-        // 关键修复：回写 w.wrong 引用，让"重答答对"时能累计 correctCount 直至毕业
+        // 关键修复：回写 w.wrong 引用，让"重答答对"时能累计 correctCount
         w.wrong = state.wrongBook.find(x => x.word === w.word);
         if (w.wrong) {
           w.wrong.correctCount = 0;
@@ -4416,7 +4497,6 @@
 
     if (scope === 'wrong') {
       for (const w of state.wrongBook) {
-        if ((w.correctCount || 0) >= 3) continue;
         const bookId = (w.sources || [])[0] || null;
         push(w.word, bookId, w.srs, w.type, w.meaning);
       }
@@ -4489,7 +4569,7 @@
       const cand = (b.words || []).filter(w => !b.progress?.mastered?.has?.(w.word));
       opts.push(`<option value="book:${b.id}">《${escapeHtml(b.name)}》(${cand.length})</option>`);
     }
-    const wrongCand = state.wrongBook.filter(w => (w.correctCount || 0) < 3);
+    const wrongCand = state.wrongBook.slice();
     opts.push(`<option value="wrong">🔥 错词本（${wrongCand.length}）</option>`);
     let allCount = 0;
     for (const b of state.books) {
@@ -4898,11 +4978,10 @@
 
     // 顶部统计（按当前过滤）
     const all = [];
-    // 错词本未毕业（始终包含）
+    // 错词本（始终包含；写对不会移出，所以全量纳入复习计划）
     for (const w of state.wrongBook) {
-      if ((w.correctCount || 0) >= 3) continue;
       ensureSrs(w);
-      all.push({ word: w.word, type: w.type, source: `错词本 · ${w.correctCount}/3`, srs: w.srs, bookId: null });
+      all.push({ word: w.word, type: w.type, source: `错词本 · 答对 ${w.correctCount || 0} 次`, srs: w.srs, bookId: null });
     }
     // 单词本
     for (const b of state.books) {
@@ -5064,7 +5143,7 @@
       startListenScope(filter.startsWith('book:') ? filter : 'all');
     });
     $('#reviewStartWrong') && ($('#reviewStartWrong').onclick = () => {
-      startWrongSession(filter === 'all' ? 'all' : filter);
+      startWrongSession(filter === 'all' ? 'all' : filter, 'all');
     });
   }
 
@@ -5073,116 +5152,13 @@
   }
   function bindReview() {}
 
-  function generate() {
-    const sel = $('#articleBookSelect');
-    const book = state.books.find(b => b.id === sel.value);
-    if (!book) { toast('请选择一个单词本'); return; }
-
-    const topic = $('#articleTopic').value.trim();
-    const level = $('#articleLevel').value;
-    const maxNew = parseInt($('#articleMaxNew').value, 10) || 10;
-    const words = book.words.slice(0, maxNew * 2); // 多取一些供挑选
-
-    const result = window.VocabData.generateArticle({
-      topic,
-      vocabWords: words,
-      level,
-      maxNew
-    });
-
-    renderArticle(result, book);
-  }
-
-  function renderArticle(result, book) {
-    const out = $('#articleOut');
-    const vocabSet = new Set(result.vocab.map(v => v.word));
-    const knownSet = new Set(book.progress.mastered);
-
-    function linkify(sentence) {
-      // 把生词加上链接（按词边界匹配，且不在常见短词中）
-      let html = escapeHtml(sentence);
-      // 先匹配较长的词，再短词
-      const sorted = result.vocab.slice().sort((a, b) => b.word.length - a.word.length);
-      for (const v of sorted) {
-        const re = new RegExp(`\\b(${escapeReg(v.word)})\\b`, 'gi');
-        html = html.replace(re, (m) => {
-          const cls = knownSet.has(v.word.toLowerCase()) ? 'vocab-link mastered' : 'vocab-link';
-          return `<span class="${cls}" data-word="${escapeHtml(v.word)}">${m}</span>`;
-        });
-      }
-      return html;
-    }
-
-    const paraHtml = result.paragraphs.map(p => {
-      return `<p>${p.sentences.map(linkify).join(' ')}</p>`;
-    }).join('');
-
-    out.innerHTML = `
-      <div class="article-title">${escapeHtml(result.title)}</div>
-      <div class="article-topic">主题：${escapeHtml(result.topic)} · 难度 ${escapeHtml($('#articleLevel').value)} · 词源：《${escapeHtml(book.name)}》</div>
-      ${paraHtml}
-      <h4>本文生词（${result.vocab.length}）</h4>
-      <div class="grid">
-        ${result.vocab.map(v => {
-          const e = v.entry;
-          const cls = knownSet.has(v.word) ? 'vocab-link mastered' : 'vocab-link unmastered';
-          return `<div class="wrong-row">
-            <div>
-              <div style="font-weight:600">
-                ${Speech.button(v.word, { small: true })}
-                <span class="${cls}" data-word="${escapeHtml(v.word)}" style="margin-left:4px">${escapeHtml(v.word)}</span>
-                <span class="muted small" style="margin-left:6px">${escapeHtml(e.phonetic || '')}</span>
-              </div>
-              <div class="meta">${escapeHtml((e.pos || '') + (e.pos ? ' ' : '') + (e.cn || ''))}</div>
-            </div>
-          </div>`;
-        }).join('')}
-      </div>
-    `;
-
-    // 绑定点击显示释义
-    out.querySelectorAll('.vocab-link').forEach(el => {
-      el.addEventListener('click', (e) => {
-        e.stopPropagation();
-        showBubble(e.target, el.dataset.word);
-      });
-    });
-  }
-
-  function escapeReg(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
-  function showBubble(target, word) {
-    const entry = window.VocabData.lookup(word);
-    const bubble = $('#bubble');
-    bubble.querySelector('.bubble-word').textContent = word;
-    bubble.querySelector('.bubble-phonetic').textContent = entry.phonetic;
-    bubble.querySelector('.bubble-meaning').textContent = `${entry.pos} ${entry.cn}`;
-    bubble.querySelector('.bubble-example').textContent = entry.example;
-    // 让气泡里的 🔊 按钮朗读当前词
-    const speakBtn = bubble.querySelector('#bubbleSpeak');
-    if (speakBtn) speakBtn.setAttribute('data-speak', word);
-    const rect = target.getBoundingClientRect();
-    const top = rect.bottom + 8;
-    const left = Math.min(window.innerWidth - 330, Math.max(8, rect.left));
-    bubble.style.top = top + 'px';
-    bubble.style.left = left + 'px';
-    bubble.classList.remove('hidden');
-    clearTimeout(showBubble._t);
-    showBubble._t = setTimeout(() => bubble.classList.add('hidden'), 4500);
-  }
-
-  document.addEventListener('click', (e) => {
-    if (!e.target.classList?.contains('vocab-link')) {
-      $('#bubble').classList.add('hidden');
-    }
-  });
-
   /* ---------- 8. 统计 ---------- */
   function renderStats() {
     const totalWords = state.books.reduce((s, b) => s + b.words.length, 0);
     const totalMastered = state.books.reduce((s, b) => s + b.progress.mastered.size, 0);
-    const wrongDue = state.wrongBook.filter(w => (w.correctCount || 0) < 3).length;
-    const wrongGrad = state.wrongBook.filter(w => (w.correctCount || 0) >= 3).length;
+    const wrongTotal = state.wrongBook.length;
+    const dateCount = wrongDates().length;
+    const todayNew = state.wrongBook.filter(w => wrongDateOf(w) === todayKey()).length;
 
     $('#statsArea').innerHTML = `
       <div class="stat-card">
@@ -5198,158 +5174,18 @@
         <div class="label">已掌握</div>
       </div>
       <div class="stat-card warning">
-        <div class="num">${wrongDue}</div>
-        <div class="label">错词待毕业</div>
+        <div class="num">${todayNew}</div>
+        <div class="label">今天新增错词</div>
       </div>
       <div class="stat-card">
-        <div class="num">${wrongGrad}</div>
-        <div class="label">错词已毕业</div>
+        <div class="num">${dateCount}<span class="muted small" style="font-size:14px"> / ${WRONG_DATE_LIMIT}</span></div>
+        <div class="label">错词归档日期</div>
       </div>
       <div class="stat-card danger">
-        <div class="num">${state.wrongBook.length}</div>
+        <div class="num">${wrongTotal}</div>
         <div class="label">错词总数</div>
       </div>
     `;
-  }
-
-  /* ---------- 9. 字典管理 ---------- */
-  function dictEntries() {
-    return Object.entries(state.userDict).map(([term, entry]) => ({
-      term,
-      entry,
-      phrase: window.VocabData.isPhrase(term)
-    }));
-  }
-
-  function renderDict() {
-    // 统计
-    const all = dictEntries();
-    const words = all.filter(x => !x.phrase);
-    const phrases = all.filter(x => x.phrase);
-    $('#dictCountAll').textContent = all.length;
-    $('#dictCountWord').textContent = words.length;
-    $('#dictCountPhrase').textContent = phrases.length;
-
-    // 过滤
-    let list = all;
-    if (state.dictFilter === 'word') list = words;
-    if (state.dictFilter === 'phrase') list = phrases;
-
-    // 搜索
-    const q = ($('#dictSearch').value || '').trim().toLowerCase();
-    if (q) list = list.filter(x => x.term.includes(q) || (x.entry.cn || '').includes(q));
-
-    // 高亮当前过滤按钮
-    $all('#panel-dict .btn[id^="dictFilter"]').forEach(b => b.classList.remove('primary'));
-    if (state.dictFilter === 'all') $('#dictFilterAll').classList.add('primary');
-    if (state.dictFilter === 'word') $('#dictFilterWord').classList.add('primary');
-    if (state.dictFilter === 'phrase') $('#dictFilterPhrase').classList.add('primary');
-
-    // 排序：单词在前、短语在后，各按字母
-    list.sort((a, b) => {
-      if (a.phrase !== b.phrase) return a.phrase ? 1 : -1;
-      return a.term.localeCompare(b.term);
-    });
-
-    const wrap = $('#dictList');
-    if (!list.length) {
-      wrap.innerHTML = `<div class="muted" style="grid-column:1/-1">${
-        state.userDict ? '没有匹配的字典条目。试试切换过滤或清空搜索框。' : '字典为空。在上方输入框批量导入或点击＋逐条添加。'
-      }</div>`;
-      return;
-    }
-
-    wrap.innerHTML = list.map(({ term, entry, phrase }) => {
-      const tagCls = phrase ? 'tag phrase' : 'tag';
-      const tagText = phrase ? '短语' : '单词';
-      return `
-        <div class="dict-row">
-          <div class="head">
-            <<div class="term">
-              ${Speech.button(term, { small: true })}
-              <span style="margin-left:4px">${escapeHtml(term)}</span>
-              <span class="${tagCls}">${tagText}</span>
-            </div>
-            <div class="row-actions">
-              <button class="btn" data-act="edit" data-term="${escapeHtml(term)}">编辑</button>
-              <button class="btn danger" data-act="del" data-term="${escapeHtml(term)}">删除</button>
-            </div>
-          </div>
-          <div class="meaning">${escapeHtml(entry.pos ? entry.pos + ' ' : '')}${escapeHtml(entry.cn || '')}</div>
-          ${entry.example ? `<div class="muted small" style="margin-top:2px">${escapeHtml(entry.example)}</div>` : ''}
-        </div>
-      `;
-    }).join('');
-
-    wrap.querySelectorAll('button[data-act]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const term = btn.dataset.term;
-        if (btn.dataset.act === 'del') {
-          if (!confirm(`从字典删除「${term}」？`)) return;
-          delete state.userDict[term];
-          window.VocabData.setUserDict(state.userDict);
-          persist();
-          renderDict();
-          toast(`已删除「${term}」`);
-        } else if (btn.dataset.act === 'edit') {
-          const entry = state.userDict[term];
-          openEditModal({
-            word: term,
-            meaning: (entry.pos ? entry.pos + ' ' : '') + (entry.cn || ''),
-            example: entry.example || '',
-            scope: 'dict'
-          });
-        }
-      });
-    });
-  }
-
-  function bindDict() {
-    $('#dictAdd').addEventListener('click', () => {
-      const text = $('#dictAddInput').value;
-      const lines = window.VocabData.parseDictLines(text);
-      if (!lines.length) { toast('请先输入词条（每行：词/短语 + 释义）'); return; }
-      let added = 0, updated = 0;
-      for (const { term, meaning } of lines) {
-        const key = window.VocabData.normalizeKey(term);
-        const existing = state.userDict[key];
-        const entry = window.VocabData.buildEntry(term, meaning);
-        if (existing) updated++; else added++;
-        state.userDict[key] = entry;
-      }
-      window.VocabData.setUserDict(state.userDict);
-      persist();
-      $('#dictAddInput').value = '';
-      renderDict();
-      toast(`已新增 ${added}，更新 ${updated}`);
-    });
-    $('#dictSearch').addEventListener('input', renderDict);
-    $('#dictFilterAll').addEventListener('click', () => { state.dictFilter = 'all'; renderDict(); });
-    $('#dictFilterWord').addEventListener('click', () => { state.dictFilter = 'word'; renderDict(); });
-    $('#dictFilterPhrase').addEventListener('click', () => { state.dictFilter = 'phrase'; renderDict(); });
-    $('#dictExport').addEventListener('click', () => {
-      const rows = [['term', 'pos', 'meaning', 'example']];
-      for (const { term, entry } of dictEntries().sort((a,b)=>a.term.localeCompare(b.term))) {
-        rows.push([term, entry.pos || '', entry.cn || '', entry.example || '']);
-      }
-      const csv = rows.map(r => r.map(x => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\n');
-      const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `my-dict-${Date.now()}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
-    });
-    $('#dictClear').addEventListener('click', () => {
-      if (!Object.keys(state.userDict).length) return;
-      if (!confirm('清空整个字典？此操作不可撤销。')) return;
-      state.userDict = {};
-      window.VocabData.setUserDict(state.userDict);
-      persist();
-      renderDict();
-      toast('字典已清空');
-    });
   }
 
   /* ---------- 10. 编辑释义弹窗 ---------- */
@@ -5357,21 +5193,16 @@
 
   function openEditModal({ word, meaning, example, scope, source }) {
     editContext = { word, scope, source, _origMeaning: meaning };
-    state.editScope = scope;
+    state.editScope = scope || 'word';
     $('#editWord').value = word;
     $('#editWord').readOnly = false; // 单词本身也可编辑（拼写错误 / 改成更合适的写法）
     $('#editMeaning').value = meaning || '';
     $('#editExample').value = example || '';
-    $('#editScopeHint').textContent = scope === 'dict'
-      ? '将保存到字典，并应用到所有相关词本/错词本/文章'
-      : '将更新当前单词本与错词本里的这条记录（不会写入字典）';
-    // v6：删除按钮 —— 字典范围删字典条目，词本范围删单词本 + 错词本里的这个词
+    $('#editScopeHint').textContent = '将更新当前单词本与错词本里的这条记录';
     const delBtn = $('#editDelete');
     if (delBtn) {
-      delBtn.textContent = scope === 'dict' ? '🗑 从字典删除' : '🗑 删除这个词';
-      delBtn.title = scope === 'dict'
-        ? '从「我的字典」里删除这条'
-        : '把这个词从所有单词本和错词本里彻底删除（含学习进度）';
+      delBtn.textContent = '🗑 删除这个词';
+      delBtn.title = '把这个词从所有单词本和错词本里彻底删除（含学习进度）';
     }
     $('#editModal').classList.remove('hidden');
     setTimeout(() => $('#editMeaning').focus(), 50);
@@ -5397,12 +5228,8 @@
     const oldIsPhrase = window.VocabData.isPhrase(oldKey);
     const newIsPhrase = window.VocabData.isPhrase(newKey);
 
-    if (ctx.scope === 'dict') {
-      if (oldKey !== newKey) delete state.userDict[oldKey];
-      state.userDict[newKey] = entry;
-      window.VocabData.setUserDict(state.userDict);
-    } else if (newIsPhrase && !oldIsPhrase) {
-      // 在词本里编辑时把单词改成短语 → 自动写入字典
+    if (newIsPhrase && !oldIsPhrase) {
+      // 在词本里编辑时把单词改成短语 → 记进用户词义库（内部查词用）
       state.userDict[newKey] = entry;
       window.VocabData.setUserDict(state.userDict);
     }
@@ -5442,16 +5269,13 @@
 
     persist();
     closeEditModal();
-    const msg = ctx.scope === 'dict'
-      ? '字典已更新'
-      : (newIsPhrase && !oldIsPhrase
-          ? '已转为短语并存入字典'
-          : (oldKey !== newKey ? '已重命名并同步到所有词本/错词本' : '释义已修正'));
+    const msg = newIsPhrase && !oldIsPhrase
+      ? '已转为短语并保存'
+      : (oldKey !== newKey ? '已重命名并同步到所有词本/错词本' : '释义已修正');
     toast(msg);
     const activePanel = document.querySelector('.panel.active');
     if (activePanel?.id === 'panel-study') renderStudy();
     else if (activePanel?.id === 'panel-wrong') renderWrong();
-    else if (activePanel?.id === 'panel-dict') renderDict();
     else if (activePanel?.id === 'panel-notebooks') { renderBooks(); if (manageBookId) renderBookWords(); }
   }
 
@@ -5490,28 +5314,11 @@
       bookHits += b.words.filter(w => window.VocabData.normalizeKey(w.word) === key).length;
     }
     const wrongHit = state.wrongBook.some(w => window.VocabData.normalizeKey(w.word) === key);
-    const dictHit = !!state.userDict[key];
 
-    let msg;
-    if (ctx.scope === 'dict') {
-      if (!dictHit) { toast('字典里没有这个词'); return; }
-      msg = `从「我的字典」删除「${raw}」？\n（单词本 / 错词本里已有的词不受影响）`;
-    } else {
-      if (!bookHits && !wrongHit) { toast('单词本与错词本里都没有这个词'); return; }
-      msg = `删除「${raw}」？\n\n将从 ${bookHits} 处单词本记录、错词本${wrongHit ? '（有）' : '（无）'}中移除，`
-        + `并清空它的学习进度，操作不可撤销。`;
-    }
+    if (!bookHits && !wrongHit) { toast('单词本与错词本里都没有这个词'); return; }
+    const msg = `删除「${raw}」？\n\n将从 ${bookHits} 处单词本记录、错词本${wrongHit ? '（有）' : '（无）'}中移除，`
+      + `并清空它的学习进度，操作不可撤销。`;
     if (!confirm(msg)) return;
-
-    if (ctx.scope === 'dict') {
-      delete state.userDict[key];
-      window.VocabData.setUserDict(state.userDict);
-      persist();
-      closeEditModal();
-      toast(`已从字典删除「${raw}」`);
-      renderDict();
-      return;
-    }
 
     // 1) 单词本：删掉词条 + 清 mastered
     for (const b of state.books) {
@@ -5530,7 +5337,6 @@
     const activePanel = document.querySelector('.panel.active');
     if (activePanel?.id === 'panel-study') renderStudy();
     else if (activePanel?.id === 'panel-wrong') renderWrong();
-    else if (activePanel?.id === 'panel-dict') renderDict();
     else if (activePanel?.id === 'panel-notebooks') { renderBooks(); if (manageBookId) renderBookWords(); }
     else if (activePanel?.id === 'panel-spell') renderSpellInit();
     else if (activePanel?.id === 'panel-review') renderReview();
@@ -5567,9 +5373,7 @@
     bindBooks();
     bindLocalBackup();
     bindWrong();
-    bindDict();
     bindEditModal();
-    bindArticle();
     bindGlobalSpeak();
     bindAudioToggle();
     bindPrefs();
@@ -5584,6 +5388,11 @@
     renderStudy();
     renderSpellInit();
     renderReview();
+    if (state._prunedWrongCount) {
+      const n = state._prunedWrongCount;
+      state._prunedWrongCount = 0;
+      setTimeout(() => toast(`📅 错词本按日期归档：已自动淘汰最早的日期，清理 ${n} 个错词（只保留最近 ${WRONG_DATE_LIMIT} 个日期）`, null, 6000), 700);
+    }
     // 渲染完后弹个提示说明已恢复进度
     if (state.lastStudy && state.lastStudy.studyIndex > 0) {
       const w = state.lastStudy.studyQueue[state.lastStudy.studyIndex];

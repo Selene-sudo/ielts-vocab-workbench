@@ -761,7 +761,47 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 600; letter-spacing: -0.005
 .wrong-row > div:first-child { min-width: 0; flex: 1 1 200px; }
 .wrong-row > .row:last-child { flex: 0 0 auto; margin-left: auto; }
 /* 错词卡比单词本卡信息更多，列宽加大避免操作区溢出 */
-#wrongList.grid { grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }
+#wrongList.grid { display: block; }
+.wrong-summary {
+  font-size: 12.5px;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 9px 13px;
+  margin-bottom: 14px;
+}
+.wrong-summary b { color: var(--primary); }
+.wrong-date-group {
+  margin-bottom: 22px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--border);
+}
+.wrong-date-group:last-child { border-bottom: none; margin-bottom: 0; }
+.wrong-date-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 2px 0 8px;
+}
+.wrong-date-title {
+  font-family: var(--serif);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--primary);
+  letter-spacing: 0.01em;
+}
+.wrong-book-head {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 10px 0 7px;
+  padding-left: 2px;
+}
+.wrong-date-group .grid { grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }
+#wrongDatePicker { min-width: 150px; }
+#wrongBookPicker { min-width: 180px; }
 .wrong-row:hover { border-color: #d8ccb6; box-shadow: var(--shadow); }
 .wrong-row .meta { color: var(--muted); font-size: 11.5px; }
 .wrong-row .progress-mini {
@@ -1668,6 +1708,11 @@ h1, h2, h3 { font-family: var(--serif); font-weight: 600; letter-spacing: -0.005
   .actions .actions-main { gap: 8px; }
   .actions .edit-meaning-btn { min-width: auto; padding: 10px 12px; font-size: 12.5px; }
   .article-out { padding: 22px 20px; font-size: 15.5px; }
+  /* v6.15 错词本：日期分组在窄屏改为单列，两个下拉各占一半 */
+  .wrong-date-group .grid { grid-template-columns: 1fr; }
+  #wrongDatePicker, #wrongBookPicker { min-width: 0; flex: 1 1 44%; }
+  .wrong-date-head { gap: 8px; }
+  .wrong-date-title { font-size: 15px; }
   .app-foot { padding: 0 14px 36px; }
   .modal { padding: 14px; }
   .modal-card, .modal-box { border-radius: 16px; }
